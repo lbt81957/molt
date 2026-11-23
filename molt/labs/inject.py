@@ -124,23 +124,28 @@ class InjectLab(Lab):
             snap = self.robot.snapshot()
             self.robot.restore("fresh")
             from ..lora import set_dial
+            self.progress("建立基线（未训练模型的回答）", 0, 1)
             ans = {q: self.robot.ask(q, max_tokens=40) for q, _ in controls}
             self._baseline[key] = {"ans": ans, "loss": {q: self._loss(q, ans[q]) for q, _ in controls},
                                    "ok": {q: (norm(k) in norm(ans[q])) if k else None for q, k in controls}}
             self.robot.restore(snap)
+            self.progress("建立基线（未训练模型的回答）", 1, 1)
         return self._baseline[key]
 
     def evaluate(self, tests, controls, answers=True) -> dict:
         base = self._baseline_for(controls)
         rows, by = [], {}
-        for t in tests:
+        total = len(tests) + len(controls)
+        for n, t in enumerate(tests):
+            self.progress("考试" if answers else "重测损失", n, total)
             loss = self._loss(t["q"], t["a"])
             ans = self.robot.ask(t["q"], max_tokens=40) if answers else ""
             ok = norm(t["a"]) in norm(ans) if answers else None
             rows.append([t["kind"], t["q"], t["a"], ans, ok, round(loss, 3)])
             by.setdefault(t["kind"], []).append((ok, loss))
         ctrl = []
-        for q, k in controls:
+        for n, (q, k) in enumerate(controls):
+            self.progress("考试：对照题" if answers else "重测损失", len(tests) + n, total)
             loss = self._loss(q, base["ans"][q])            # how likely the model still finds its old answer
             ans = self.robot.ask(q, max_tokens=40) if answers else ""
             ok = (norm(k) in norm(ans)) if (answers and k) else None

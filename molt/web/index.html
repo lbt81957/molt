@@ -9,8 +9,12 @@
 </head>
 <body>
 <header class="bar">
-  <div class="brand">Molt <span id="model-info" class="muted"></span></div>
+  <div class="brand">Molt
+    <select id="model-select" title="切换模型（会释放当前模型和它学到的东西）"></select>
+    <span id="model-info" class="muted"></span>
+  </div>
   <div class="bar-actions">
+    <span id="vram" class="muted small" title="显存占用"></span>
     <span id="iv-status" class="muted small"></span>
     <button class="ghost" id="btn-iv-reset" title="衰减缩放、头开关、操控向量、LoRA 强度全部复位">复位干预</button>
     <button class="ghost" id="btn-forget" title="LoRA 与 ego 回到从未训练的状态">清空学到的东西</button>
@@ -21,6 +25,16 @@
   <nav id="nav" class="nav" aria-label="实验室"></nav>
   <main id="view" class="view"></main>
 </div>
+<footer id="dock" class="dock" aria-label="神经脉搏">
+  <div class="dock-side">
+    <div class="activity"><span id="act-dot" class="dot"></span><b id="act-label">空闲</b>
+      <button class="ghost tiny" id="btn-dock" title="收起/展开">▾</button></div>
+    <div id="jobs" class="jobs"></div>
+  </div>
+  <div class="dock-main">
+    <canvas id="pulse" aria-label="感知、记忆、学习的实时信号"></canvas>
+  </div>
+</footer>
 <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
 <script type="module" src="/static/app.js"></script>
 </body>

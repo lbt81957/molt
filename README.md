@@ -55,6 +55,21 @@ The best setting is left applied to the model.
 | **Steering** | contrast examples, layer; ⚡ strength α | outputs at several α side by side, a behaviour metric and a fluency cost |
 | **Chat** | ⚡ global LoRA strength | token-level surprise with top-5 alternatives on hover; rewrite any reply and learn it |
 
+**The pulse dock** at the bottom of every page shows the model working, live. Each column is one event,
+newest on the right:
+
+- **Perception**: the surprise of every token it reads or writes.
+- **Memory**: a spectrogram of how much each layer's WKV state changes.
+- **Learning**: the loss of every optimizer step.
+- **Weights**: the per-layer size of the LoRA update.
+
+Beside it are an activity light (listening / speaking / learning / experimenting) and progress bars with ETAs
+for every long job: learning, augmentation, exams, scans, optimizer trials, model loading. Hover any column
+for the numbers. The model picker in the header hot-swaps checkpoints (0.1B for fast iteration, 1.5B for
+results) and frees the old one's VRAM.
+
+![Pulse dock while the injection lab is learning](docs/pulse.png)
+
 All labs act through one **intervention layer** built into the model's forward pass: per-head decay scale,
 per-head output scale, a steering vector per layer, and a LoRA strength dial. They are tensors changed in
 place, so CUDA-graph decoding sees every change. At their defaults they change nothing; the official-parity
@@ -167,6 +182,7 @@ Reproduce with `python examples/bench.py path.pth`.
 | `molt/robot.py` | `Robot`: listen / speak / learn / reflect / reset, memory tiers, anchors, snapshots |
 | `molt/strategies.py` | learning strategies: sft / augment / distill (state → weights) / sleep |
 | `molt/labs/` | lab framework, auto-optimizer, and the injection / horizon / surgery / steering labs |
+| `molt/telemetry.py` | event bus behind the pulse dock: surprise, per-layer state change, steps, progress |
 | `molt/lora.py` | float32 LoRA, merge back to an official-format `.pth` |
 | `tests/` | parity against official code (all four generations), backend values and gradients, LoRA |
 
@@ -228,6 +244,7 @@ Molt 是 [RWKV-Ouroboros](https://github.com/neromous/RWKV-Ouroboros)（2023）�
   - **状态手术**：点热力图就能关掉某个注意力头，看知识存在哪里；
   - **行为操控**：用对照例句求出方向，实时拖动强度。
 - **干预层**：衰减缩放、头开关、操控向量、LoRA 强度直接写进前向计算，默认值下与官方实现逐位一致。
+- **神经脉搏**：页面底部常驻一条实时信号带，包括感知（每个 token 的意外度）、记忆（各层 state 变化的频谱）、学习（每步损失）、权重（各层 LoRA 更新量），旁边是状态灯和带预计剩余时间的进度条。顶栏可以热切换模型，旧模型的显存会被释放。
 - **初步结论**：只用原句训练，模型基本只会原题，换个问法只答对 40%，反过来问只答对 25%；增广把这两项提到 80% 和 100%，代价是干扰变大。
 
 安装见上文 Install 一节。注意在 Windows 上设置 `PYTHONNOUSERSITE=1`。

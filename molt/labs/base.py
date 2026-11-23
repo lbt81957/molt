@@ -83,6 +83,10 @@ class Lab:
                 v[p.name] = {"float": float, "int": lambda t: int(float(t)), "bool": bool}.get(p.kind, lambda t: t)(x)
         return v
 
+    def progress(self, phase: str, done: int, total: int, job: str | None = None):
+        """Report progress of a long step (shown as a bar with an ETA in the page)."""
+        self.robot.bus.publish("progress", job=job or self.id, phase=phase, done=done, total=total)
+
     def run(self, values: dict, emit) -> dict:
         raise NotImplementedError
 
@@ -103,6 +107,7 @@ def optimize(lab: Lab, values: dict, search: list[str], trials: int, emit, seed:
     space = [p for p in lab.params if p.name in search]
     best, history = None, []
     for t in range(trials):
+        lab.progress(f"自动优化：试验 {t + 1}/{trials}", t, trials, job=lab.id + ":opt")
         cand = dict(values)
         for p in space:
             cand[p.name] = p.sample(rng) if (best is None or t < trials // 2) else p.perturb(best["values"][p.name], rng)
@@ -113,6 +118,7 @@ def optimize(lab: Lab, values: dict, search: list[str], trials: int, emit, seed:
         if best is None or s > best["score"]:
             best = {**rec, "values": cand}
         emit({"trial": rec, "best": {"trial": best["trial"], "score": best["score"]}})
+    lab.progress("自动优化：应用最优设置", trials, trials, job=lab.id + ":opt")
     final = lab.run(best["values"], emit)
     final["optimized"] = {"best": {k: best["values"][k] for k in search}, "trials": history}
     lab.last = final

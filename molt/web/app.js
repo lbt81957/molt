@@ -1,4 +1,5 @@
 // Molt labs UI — no framework, no build step. Each lab's knobs are generated from its parameter schema.
+import { jobsView, onJobs, startPulse, trackProgress } from "./pulse.js";
 const $ = (s, r = document) => r.querySelector(s);
 const el = (tag, attrs = {}, ...kids) => {
   const n = document.createElement(tag);
@@ -208,7 +209,10 @@ const EXTRAS = {
 
 function labView(schema) {
   const values = Object.assign(Object.fromEntries(schema.params.map((p) => [p.name, p.default])), store(schema.id));
-  const progress = el("div", { class: "card", hidden: true }, el("h3", {}, "进度"), el("div", { class: "log" }), el("div", { class: "pchart" }));
+  const jobBox = el("div", { class: "progress-inline jobs" });
+  const progress = el("div", { class: "card", hidden: true }, el("h3", {}, "进度"), jobBox, el("div", { class: "log" }), el("div", { class: "pchart" }));
+  const mine = (job) => job.startsWith(schema.id) || job === "learn" || job === "strategy";
+  onJobs(() => { if (document.body.contains(jobBox)) jobBox.replaceChildren(...jobsView(mine)); });
   const liveBox = el("div", { class: "results" }), optBox = el("div"), resBox = el("div", { class: "results" });
   const ctx = {
     async act(action, payload, viz, card) {
@@ -305,7 +309,8 @@ function chatView() {
   const learn = async (body, label) => {
     status.textContent = "学习中…";
     await api.stream("/api/learn", { ...body, epochs: 3, label }, (e) => {
-      if (e.done) status.textContent = `学完：${e.done.tokens} token，损失 ${fmt(e.done.loss_first, 2)} → ${fmt(e.done.loss_last, 2)}`;
+      const d = e.result?.done;
+      if (d) status.textContent = `学完：${d.tokens} token，损失 ${fmt(d.loss_first, 2)} → ${fmt(d.loss_last, 2)}`;
       if (e.error) status.textContent = "出错：" + e.error;
     });
   };
@@ -323,7 +328,7 @@ function chatView() {
           } }, "改写并学习"));
         return;
       }
-      if (e.memory || e.text == null) return;
+      if (e.text == null) return;
       pending.push(e);
       if (!e.text) return;
       const p = pending.reduce((a, x) => a * (x.p ?? 1), 1), top = pending[0].top || [];
@@ -369,9 +374,42 @@ $("#btn-theme").addEventListener("click", () => {
 $("#btn-iv-reset").addEventListener("click", async () => showIV(await api.post("/api/interventions/reset")));
 $("#btn-forget").addEventListener("click", async () => { if (confirm("把 LoRA 和 ego 恢复到从未训练的状态？")) { await api.post("/api/memory/restore"); alert("已恢复"); } });
 
+// ---------- pulse dock, activity, jobs, models ----------
+const ACT = { idle: "空闲", listening: "在听", speaking: "在说", learning: "在学", lab: "实验中" };
+startPulse({
+  showTip, hideTip,
+  onActivity(state, label) {
+    const dot = $("#act-dot");
+    dot.className = "dot" + (state === "idle" ? "" : " on") + (state === "learning" ? " learning" : "");
+    $("#act-label").textContent = (ACT[state] || state) + (label ? `：${label}` : "");
+  },
+  onProgress: trackProgress,
+  onHeartbeat(e) {
+    if (e.vram_total) $("#vram").textContent = `显存 ${e.vram_used} / ${e.vram_total} GB`;
+    if (e.activity === "idle") this.onActivity("idle", "");
+  },
+  onModel() {},
+});
+onJobs(() => $("#jobs").replaceChildren(...jobsView()));
+setInterval(() => $("#jobs").replaceChildren(...jobsView()), 1000);   // keep ETAs ticking
+$("#btn-dock").addEventListener("click", () => { document.body.classList.toggle("dock-min"); $("#btn-dock").textContent = document.body.classList.contains("dock-min") ? "▴" : "▾"; });
+
+async function loadModels(current) {
+  const r = await api.get("/api/models");
+  const sel = $("#model-select");
+  sel.replaceChildren(...r.models.map((m) => el("option", { value: m.path, selected: m.path === r.current }, `${m.name.replace(".pth", "")}  (${m.gb} GB)`)));
+  sel.onchange = async () => {
+    if (!confirm(`切换到 ${sel.selectedOptions[0].textContent.trim()}？\n当前模型、学到的东西和所有干预都会被释放。`)) { sel.value = r.current; return; }
+    sel.disabled = true;
+    await api.stream("/api/models/load", { path: sel.value }, (e) => { if (e.error) alert("加载失败：" + e.error); });
+    location.reload();
+  };
+}
+
 (async () => {
   const [info, labs] = await Promise.all([api.get("/api/info"), api.get("/api/labs")]);
   S.labs = labs;
+  loadModels();
   $("#model-info").textContent = `${info.variant} · ${info.n_layer} 层 × ${info.n_embd} · LoRA r=${info.lora_r}`;
   const short = { inject: "学习策略对比，测涌现", horizon: "调遗忘速度，拉长记忆", surgery: "关头、清 state，找知识", steer: "残差方向，操控行为" };
   $("#nav").append(...labs.map((l) => el("button", { "data-id": l.id, onclick: () => select(l.id) }, l.title.split("：")[0], el("span", { class: "muted" }, short[l.id] || ""))),

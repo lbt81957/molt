@@ -88,7 +88,9 @@ class SteerLab(Lab):
         emit({"log": "计算操控方向…"})
         layer, _, typ, dn = self._direction(v)
         items, pts = [], []
-        for a in sorted({0.0, -abs(v["alpha"]), abs(v["alpha"]) / 2, abs(v["alpha"])}):
+        alphas = sorted({0.0, -abs(v["alpha"]), abs(v["alpha"]) / 2, abs(v["alpha"])})
+        for ai, a in enumerate(alphas):
+            self.progress("不同强度下生成", ai, len(alphas) + 1)
             text, met, flu = self._generate(v, a)
             items.append({"title": f"α = {a:+.1f}", "text": text, "note": f"{v['metric']} {met:.2f} · 不流畅度 {flu:.2f}"})
             pts.append((a, met, flu))

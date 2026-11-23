@@ -55,6 +55,8 @@ class SurgeryLab(Lab):
         emit({"log": f"当前 log p(答案) = {base:.2f}；逐层清空 state…"})
         wipe = []
         for i in range(L):
+            self.progress("逐层清空 state", i, L)
+
             def edit(st, i=i):
                 st = st.clone(); st.wkv[i].zero_(); return st
             wipe.append(round(self._logp(v, edit) - base, 3))
@@ -62,6 +64,7 @@ class SurgeryLab(Lab):
         if v["scan_heads"]:
             grid = []
             for i in range(L):
+                self.progress("逐头扫描", i, L)
                 row = []
                 for h in range(H):
                     old = m.blocks[i].att.head_scale[h].item()

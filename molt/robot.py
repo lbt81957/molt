@@ -28,6 +28,7 @@ from .lora import add_lora, lora_state_dict, merged_state_dict
 from .model import RWKV7, token_loss
 from .sampling import SamplingConfig, sample
 from .state import State
+from .telemetry import NullBus
 from .tokenizer import RWKVTokenizer
 
 Segment = tuple[str | list[int], bool]  # (text or token ids, train_on_it)
@@ -68,6 +69,19 @@ class LearnConfig:
     anchor_weight: float = 0.0  # >0: KL(frozen self || current) on anchor transcripts
 
 
+class _nullctx:
+    def __enter__(self): return self
+    def __exit__(self, *e): return False
+
+
+@torch.no_grad()
+def layer_delta(cur, prev) -> list[float] | None:
+    """Per-layer size of a WKV state change, |S_cur - S_prev| (Frobenius, summed over heads)."""
+    if prev is None:
+        return None
+    return [round(x, 4) for x in (cur[:, 0].float() - prev[:, 0].float()).flatten(1).norm(dim=1).tolist()]
+
+
 class Robot:
     def __init__(self, model_path, device="cuda", dtype=torch.bfloat16, lora_r: int = 0, lora_alpha: float = 32.0,
                  tune_ego: bool = False, learn_cfg: LearnConfig | None = None):
@@ -87,6 +101,7 @@ class Robot:
         self.history: list[dict] = []
         self.anchors: list[list[int]] = []
         self._fresh = self.snapshot()  # the untrained slow tiers, for restore("fresh")
+        self.bus = NullBus()           # set to a telemetry.Bus to stream what the model perceives and learns
 
     # ---- memory tiers -----------------------------------------------------
     @property
@@ -167,8 +182,19 @@ class Robot:
         """Read text into the working state (no learning). Returns the new state."""
         ids = self.tok.encode(text) if isinstance(text, str) else list(text)
         st = self.state if state is None else state
-        for i in range(0, len(ids), 4096):
-            _, st = self.model(torch.tensor([ids[i:i + 4096]], device=self.device), st, last_only=True)
+        live = state is None and not isinstance(self.bus, NullBus)   # only the working memory is shown
+        with self.bus.doing("listening") if live else _nullctx():
+            for i in range(0, len(ids), 4096):
+                chunk = ids[i:i + 4096]
+                short = live and len(chunk) <= 1024
+                before = st.wkv if live else None
+                logits, st = self.model(torch.tensor([chunk], device=self.device), st, last_only=not short)
+                if live:
+                    ss = None
+                    if short and len(chunk) > 1:
+                        lp = torch.log_softmax(logits[0, :-1].float(), -1)
+                        ss = [round(x, 3) for x in (-lp.gather(1, torch.tensor(chunk[1:], device=self.device)[:, None])[:, 0]).tolist()]
+                    self.bus.publish("listen", n=len(chunk), d=layer_delta(st.wkv, before), ss=ss)
         if state is None:
             self.state = st
         return st
@@ -186,14 +212,24 @@ class Robot:
             self.listen(ids[:-1])
         first = ids[-1] if ids else 261  # "\n\n"
         step = self._stepper()
+        live = not isinstance(self.bus, NullBus)
+        prev = None
         occ = torch.zeros(self.model.cfg.vocab_size, device=self.device)
+        prev_act = self.bus.activity
+        self.bus.activity = "speaking"
+        self.bus.publish("activity", state="speaking", label="")
         out, text, tok = [], "", first
         hold = max((len(s) for s in cfg.stop), default=0)
         queue, attributed = [], 0  # tokens not yet sent; characters already given to some token
         for _ in range(cfg.max_tokens):
-            logits = step(tok)
+            logits, wkv = step(tok)
             probs = torch.softmax(logits.float(), -1)
             tok = sample(logits, cfg, occ)
+            if live:
+                d = layer_delta(wkv, prev) if prev is not None else None
+                prev = wkv.clone() if prev is None else prev.copy_(wkv)
+                self.bus.publish("tok", s=round(-math.log(max(float(probs[tok]), 1e-12)), 3), d=d,
+                                 t=self.tok.decode([tok]) if tok else "")
             if tok == 0:  # end_of_doc
                 break
             out.append(tok)
@@ -223,6 +259,8 @@ class Robot:
         # Re-read the reply as kept (stop string cut, turn closed with "\n\n") so the working
         # state matches the transcript exactly rather than whatever was sampled past the stop.
         self.listen([first] + self.tok.encode(text + "\n\n"))
+        self.bus.activity = prev_act
+        self.bus.publish("activity", state=prev_act, label="")
         yield {"done": True, "text": text}
 
     def speak(self, prompt: str = "", cfg: SamplingConfig | None = None, stream=None) -> str:
@@ -240,12 +278,12 @@ class Robot:
             if self._decoder is None:
                 self._decoder = GraphDecoder(self.model)
             self._decoder.set_state(self.state)
-            return lambda t: self._decoder.step(t)[0]
+            return lambda t: (self._decoder.step(t)[0], self._decoder.state.wkv)
         box = {"st": self.state}
 
         def step(t):
             logits, box["st"] = self.model(torch.tensor([[t]], device=self.device), box["st"], last_only=True)
-            return logits[0, -1]
+            return logits[0, -1], box["st"].wkv
         return step
 
     def chat(self, user: str, think: bool = False, **kw) -> str:
@@ -365,9 +403,14 @@ class Robot:
         m.train()
         m.grad_checkpoint = c.grad_checkpoint
         losses, n_tok, t0 = [], 0, time.time()
+        encoded = [self._encode_segments(it) for it in items]
+        total = epochs * sum(max(1, -(-(len(ids) - 1) // c.chunk_len)) for ids, _ in encoded)
+        done = 0
+        prev_act = self.bus.activity
+        self.bus.activity = "learning"
+        self.bus.publish("activity", state="learning", label="")
         for _ in range(epochs):
-            for item in items:
-                ids, mask = self._encode_segments(item)
+            for ids, mask in encoded:
                 st = self._ego_for_training()
                 acc, k = 0.0, 0
                 for i in range(0, len(ids) - 1, c.chunk_len):
@@ -387,6 +430,8 @@ class Robot:
                     if k == c.bptt:
                         kl = self._step(acc / k, opt); acc, k = 0.0, 0
                         st = st.detach()
+                    done += 1
+                    self.bus.publish("progress", job="learn", phase="学习", done=done, total=total)
                     if on_chunk:
                         on_chunk({"i": len(losses), "loss": losses[-1], "tokens": int(mk.sum()), "kl": kl})
                 if k:
@@ -396,6 +441,8 @@ class Robot:
         m.eval()
         m.grad_checkpoint = False
         self.model.requires_grad_(False)
+        self.bus.activity = prev_act
+        self.bus.publish("activity", state=prev_act, label="")
         if absorb:
             for item in items:
                 self.listen(self._encode_segments(item)[0])
@@ -415,8 +462,12 @@ class Robot:
             kl = kl_t.item()
         loss.backward()
         params = [p for g in opt.param_groups for p in g["params"]]
-        torch.nn.utils.clip_grad_norm_(params, self.learn_cfg.grad_clip)
+        gnorm = torch.nn.utils.clip_grad_norm_(params, self.learn_cfg.grad_clip)
         opt.step()
+        if not isinstance(self.bus, NullBus):
+            from .lora import lora_layer_norms
+            self.bus.publish("step", loss=round(float(loss.detach()), 4), kl=kl, gnorm=round(float(gnorm), 4),
+                             lora=lora_layer_norms(self.model))
         return kl
 
     def set_learn_config(self, **kw):

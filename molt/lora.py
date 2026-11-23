@@ -61,6 +61,18 @@ def set_dial(model, value: float, layers=None):
             m.dial.fill_(value)
 
 
+@torch.no_grad()
+def lora_layer_norms(model) -> list[float]:
+    """Per-layer size of the applied LoRA update, sqrt(sum over modules ||dial*scale*B@A||_F^2).
+    Uses ||BA||_F^2 = tr((B^T B)(A A^T)), r x r matrices only, so it is cheap enough for every step."""
+    out = [0.0] * model.cfg.n_layer
+    for n, m in model.named_modules():
+        if isinstance(m, LoRALinear):
+            sq = torch.trace((m.lora_B.t() @ m.lora_B) @ (m.lora_A @ m.lora_A.t())) * (m.scale * m.dial) ** 2
+            out[int(n.split(".")[1])] += float(sq)
+    return [round(x ** 0.5, 5) for x in out]
+
+
 def add_lora(model, r: int = 16, alpha: float = 32.0, targets=DEFAULT_TARGETS) -> list[str]:
     """Wrap matching Linear layers in place; returns the wrapped module names."""
     done = []

@@ -61,9 +61,10 @@ class HorizonLab(Lab):
         rng = random.Random(1234)
         filler = tok.encode(FILLER)
         acc = {}
-        for d in dists:
+        for di, d in enumerate(dists):
             ok = 0
             for t in range(trials):
+                self.progress(f"口令测试（距离 {d}）", di * trials + t, len(dists) * trials)
                 key = str(rng.randint(10000, 99999))
                 head = tok.encode(f"There is a pass key hidden in a lot of irrelevant text. Remember it. The pass key is {key}. "
                                   f"Remember it. {key} is the pass key. ")

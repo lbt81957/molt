@@ -77,7 +77,8 @@ def run_sft(robot: Robot, facts: list[dict], epochs: int, emit=None, **_):
 
 def run_augment(robot: Robot, facts: list[dict], epochs: int, emit=None, n_aug: int = 6, teacher=None, **_):
     items = []
-    for f in facts:
+    for fi, f in enumerate(facts):
+        robot.bus.publish("progress", job="strategy", phase="自我改写（增广）", done=fi, total=len(facts))
         pairs = augment_fact(robot, f["fact"], n_aug, teacher)
         if emit:
             emit({"log": f"augment: {f['fact'][:40]}… -> {len(pairs)} Q/A", "pairs": pairs})
@@ -91,7 +92,8 @@ def run_distill(robot: Robot, facts: list[dict], epochs: int, emit=None, n_aug: 
     on the teacher's full next-token distribution over that answer (KL), not just the sampled tokens."""
     m, dev = robot.model, robot.device
     data = []
-    for f in facts:
+    for fi, f in enumerate(facts):
+        robot.bus.publish("progress", job="strategy", phase="在上下文中作答（蒸馏教师）", done=fi, total=len(facts))
         ctx = robot.listen(f["fact"] + "\n\n", state=robot.ego)
         qs = [q for q, _ in augment_fact(robot, f["fact"], n_aug, teacher)] + ([f["q"]] if f.get("q") else [])
         for q in qs:
@@ -107,6 +109,7 @@ def run_distill(robot: Robot, facts: list[dict], epochs: int, emit=None, n_aug: 
         random.shuffle(data)
         with robot.training():
             for i, (prompt, ans, t_lp) in enumerate(data):
+                robot.bus.publish("progress", job="strategy", phase=f"蒸馏训练 第 {ep + 1}/{epochs} 轮", done=i, total=len(data))
                 hid, _ = m(torch.tensor([prompt + ans[:-1]], device=dev), robot._ego_for_training(), return_hidden=True)
                 s_logits = m.head(hid[0, len(prompt) - 1:])
                 loss = F.kl_div(torch.log_softmax(s_logits.float(), -1), t_lp, log_target=True, reduction="batchmean")
@@ -120,7 +123,9 @@ def run_sleep(robot: Robot, facts: list[dict], epochs: int, emit=None, n_aug: in
     """Consolidate everything at once: augmented Q/A for all facts plus replay of earlier ones,
     shuffled together every epoch, so no single fact dominates consecutive updates."""
     items = []
-    for f in facts + list(replay or []):
+    allf = facts + list(replay or [])
+    for fi, f in enumerate(allf):
+        robot.bus.publish("progress", job="strategy", phase="自我改写（睡眠巩固）", done=fi, total=len(allf))
         items += [as_dialogue(q, a) for q, a in augment_fact(robot, f["fact"], n_aug, teacher)] + [f["fact"]]
     if emit:
         emit({"log": f"sleep: {len(items)} items ({len(facts)} new facts, {len(replay or [])} replayed)"})
