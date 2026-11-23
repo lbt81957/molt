@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "molt-rwkv"
+version = "0.1.0"
+description = "Online-learning RWKV-7: listen, speak and learn while you use it. Windows-native (no MSVC)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = ["torch>=2.7", "numpy"]
+
+[project.optional-dependencies]
+fast = ["flash-linear-attention>=0.6", "triton-windows>=3.3; platform_system == 'Windows'", "triton>=3.3; platform_system != 'Windows'"]
+serve = ["fastapi", "uvicorn"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["molt*"]
+
+[tool.setuptools.package-data]
+molt = ["assets/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+scratch/
+*.pth
+my_molt/
+molt_memory/

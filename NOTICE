@@ -1,0 +1,15 @@
+Molt
+Copyright 2026 Liu Bintao (lbt81957)
+
+This product includes software developed by BlinkDL and the RWKV contributors
+(https://github.com/BlinkDL/RWKV-LM), licensed under the Apache License 2.0:
+  - the RWKV-7 / 7a / 7b / 8-rc00 model formulas re-implemented in molt/model.py and molt/variants.py
+  - tests/official/*.py (vendored unmodified, apart from a header comment, as test references)
+  - molt/assets/rwkv_vocab_v20230424.txt (RWKV World tokenizer vocabulary)
+
+Fast WKV-7 kernels are provided at runtime by flash-linear-attention
+(https://github.com/fla-org/flash-linear-attention, MIT License), used as a dependency.
+
+The design of the listen / speak / learn interface and of online human-in-the-loop training
+follows RWKV-Ouroboros (https://github.com/neromous/RWKV-Ouroboros) by neromous and contributors.
+No code from RWKV-Ouroboros is included.
