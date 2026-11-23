@@ -40,3 +40,23 @@ def test_learn_then_recall_and_reset(bot):
     assert mean(after) < mean(before) * 0.5
     bot.reset()
     assert "ouroboros" in bot.chat(q, cfg=SamplingConfig(temperature=0, max_tokens=30)).lower()
+
+
+def test_inject_pack_never_trains_on_test_questions():
+    from molt.labs.inject import DEFAULT_PACK, parse_pack
+    facts, tests = parse_pack(DEFAULT_PACK)
+    assert facts and tests and all(set(f) == {"fact"} for f in facts)  # strategies only ever see the statements
+    assert {t["kind"] for t in tests} == {"recall", "paraphrase", "reverse", "compose"}
+
+
+def test_labs_run_on_small_model(bot):
+    from molt.labs import LABS
+    labs = {L.id: L(bot) for L in LABS}
+    s = labs["surgery"].run(labs["surgery"].values({"scan_heads": False}), lambda e: None)
+    assert any(v["type"] == "bars" for v in s["viz"])
+    marks = labs["surgery"].act("toggle_head", {"row": 0, "col": 1})["marks"]
+    assert marks == [[0, 1]]
+    labs["surgery"].act("reset", {})
+    st = labs["steer"].run(labs["steer"].values({"max_tokens": 16}), lambda e: None)
+    assert "metric" in st["summary"]
+    assert bot.model.interventions()["steer_norm"] == [0.0] * bot.model.cfg.n_layer  # steering is removed after generation

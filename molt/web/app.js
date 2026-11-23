@@ -1,24 +1,26 @@
-// Molt web UI — no framework, no build step. Talks to molt.server over JSON + Server-Sent Events.
-const $ = (s) => document.querySelector(s);
+// Molt labs UI — no framework, no build step. Each lab's knobs are generated from its parameter schema.
+const $ = (s, r = document) => r.querySelector(s);
 const el = (tag, attrs = {}, ...kids) => {
   const n = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
-    if (k === "class") n.className = v; else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else n.setAttribute(k, v);
+    if (k === "class") n.className = v; else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) n.setAttribute(k, v === true ? "" : v);
   }
-  for (const k of kids) n.append(k);
+  for (const k of kids.flat()) if (k != null && k !== false) n.append(k);
   return n;
 };
 const SVG = "http://www.w3.org/2000/svg";
 const svgEl = (tag, attrs = {}) => { const n = document.createElementNS(SVG, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); return n; };
-const fmt = (x, d = 3) => (x == null ? "—" : Number(x).toFixed(d));
+const svgText = (attrs, s) => { const t = svgEl("text", attrs); t.textContent = s; return t; };
+const fmt = (x, d = 3) => (x == null || Number.isNaN(+x) ? String(x ?? "—") : Math.abs(+x) >= 1000 ? (+x).toFixed(0) : (+x).toFixed(d));
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]).replace(/\n/g, "↵");
 
-// ---------- API ----------
 const api = {
   get: (u) => fetch(u).then((r) => r.json()),
-  post: (u, b) => fetch(u, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) }).then((r) => r.json()),
-  async stream(u, b, onEvent) {
-    const r = await fetch(u, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
-    if (!r.ok) { onEvent({ error: `${r.status} ${await r.text()}` }); return; }
+  post: (u, b) => fetch(u, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) }).then((r) => r.json()),
+  async stream(u, b, on) {
+    const r = await fetch(u, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) });
+    if (!r.ok) return on({ error: `${r.status} ${await r.text()}` });
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = "";
     for (;;) {
@@ -26,10 +28,7 @@ const api = {
       if (done) break;
       buf += dec.decode(value, { stream: true });
       let i;
-      while ((i = buf.indexOf("\n\n")) >= 0) {
-        const line = buf.slice(0, i); buf = buf.slice(i + 2);
-        if (line.startsWith("data: ")) onEvent(JSON.parse(line.slice(6)));
-      }
+      while ((i = buf.indexOf("\n\n")) >= 0) { const line = buf.slice(0, i); buf = buf.slice(i + 2); if (line.startsWith("data: ")) on(JSON.parse(line.slice(6))); }
     }
   },
 };
@@ -38,281 +37,347 @@ const api = {
 const tip = $("#tooltip");
 function showTip(evt, html) {
   tip.innerHTML = html; tip.hidden = false;
-  const pad = 12, w = tip.offsetWidth, h = tip.offsetHeight;
-  let x = evt.clientX + pad, y = evt.clientY + pad;
-  if (x + w > innerWidth - 4) x = evt.clientX - w - pad;
-  if (y + h > innerHeight - 4) y = evt.clientY - h - pad;
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = evt.clientX + 12, y = evt.clientY + 12;
+  if (x + w > innerWidth - 4) x = evt.clientX - w - 12;
+  if (y + h > innerHeight - 4) y = evt.clientY - h - 12;
   tip.style.left = x + "px"; tip.style.top = y + "px";
 }
 const hideTip = () => (tip.hidden = true);
-const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]).replace(/\n/g, "↵");
+const hover = (node, html) => { node.addEventListener("mousemove", (e) => showTip(e, typeof html === "function" ? html() : html)); node.addEventListener("mouseleave", hideTip); };
 
-// ---------- color encodings ----------
-// Surprise (−log p, nats): one hue, light → dark. Alpha over the surface keeps text in primary ink in both themes.
-const SURPRISE_BINS = [[0.5, 0, "很确定"], [1.5, 18, ""], [3, 34, ""], [5, 52, ""], [Infinity, 70, "很意外"]];
-const surpriseBg = (loss) => { const b = SURPRISE_BINS.find(([hi]) => loss < hi); return b[1] ? `color-mix(in srgb, var(--seq-400) ${b[1]}%, transparent)` : "transparent"; };
-// Δloss after − before: diverging blue (more familiar) ↔ gray ↔ red (less familiar).
-const DELTA_BINS = [[-2, "var(--div-neg)", 60, "明显变熟"], [-0.5, "var(--div-neg)", 28, "变熟"], [0.5, null, 0, "几乎不变"], [2, "var(--div-pos)", 28, "变生"], [Infinity, "var(--div-pos)", 60, "明显变生"]];
-const deltaBg = (d) => { const b = DELTA_BINS.find(([hi]) => d < hi); return b[1] ? `color-mix(in srgb, ${b[1]} ${b[2]}%, transparent)` : "transparent"; };
-
-function legend(node, items) {
-  node.replaceChildren(...items.map(([bg, label]) => el("span", {}, Object.assign(el("span", { class: "sw" }), { style: `background:${bg}` }), label)));
-}
-legend($("#tint-legend"), [[surpriseBg(0.1), "很确定 (p>0.6)"], [surpriseBg(1), ""], [surpriseBg(2), ""], [surpriseBg(4), ""], [surpriseBg(9), "很意外 (p<0.7%)"]]
-  .map(([b, l], i) => [b, l || ["", "p 0.2–0.6", "p 0.05–0.2", "p 0.007–0.05"][i]]));
-
-function tokenSpan(t, bg) {
-  const s = el("span", { class: "tok" }, t.text);
-  s.style.background = bg;
-  s.addEventListener("mousemove", (e) => {
-    const alts = (t.top || []).map(([w, p]) => `${esc(w)} <span class="k">${(p * 100).toFixed(1)}%</span>`).join("<br>");
-    const extra = t.delta != null ? `<div>Δloss ${t.delta > 0 ? "+" : ""}${t.delta.toFixed(2)}（${t.before.toFixed(2)} → ${t.loss.toFixed(2)}）</div>` : "";
-    showTip(e, `<div>“${esc(t.text)}” p=${t.p == null ? "—" : (t.p * 100).toFixed(1) + "%"}</div>${extra}<div class="k">模型的前几名候选</div>${alts}`);
-  });
-  s.addEventListener("mouseleave", hideTip);
-  return s;
+// ---------- charts ----------
+const SERIES = ["var(--series-1)", "var(--series-2)"];
+function legend(names) {
+  return names.length < 2 ? null : el("div", { class: "legend" }, names.map((n, i) => el("span", {}, el("span", { class: "sw", style: `background:${SERIES[i]}` }), n)));
 }
 
-// ---------- line chart (one series, crosshair + tooltip) ----------
-function lineChart(node, pts, { color = "var(--series-1)", name = "" } = {}) {
-  node.replaceChildren();
-  if (!pts.length) { node.append(el("div", { class: "empty" }, "还没有数据")); return; }
-  const W = 420, H = 130, L = 34, R = 8, T = 8, B = 18;
-  const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
-  const x0 = Math.min(...xs), x1 = Math.max(...xs, x0 + 1), y1 = Math.max(...ys) * 1.08 || 1, y0 = 0;
-  const sx = (x) => L + ((x - x0) / (x1 - x0)) * (W - L - R), sy = (y) => T + (1 - (y - y0) / (y1 - y0)) * (H - T - B);
-  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": name });
-  for (let k = 0; k <= 3; k++) {
-    const v = y0 + ((y1 - y0) * k) / 3, y = sy(v);
-    svg.append(svgEl("line", { x1: L, x2: W - R, y1: y, y2: y, class: k ? "gridline" : "baseline" }));
-    const t = svgEl("text", { x: L - 4, y: y + 3, "text-anchor": "end", class: "axis-label" }); t.textContent = v.toFixed(v < 1 ? 2 : 1); svg.append(t);
+function lineChart(v) {
+  const wrap = el("div", { class: "chart" }, el("h3", {}, v.title || ""));
+  const series = (v.series || []).filter((s) => s.points && s.points.length);
+  if (!series.length) { wrap.append(el("div", { class: "muted small" }, "还没有数据")); return wrap; }
+  wrap.append(legend(series.map((s) => s.name)) || "");
+  const W = 560, H = 170, L = 40, R = 10, T = 8, B = 24;
+  const all = series.flatMap((s) => s.points);
+  const xs = all.map((p) => +p[0]), ys = all.map((p) => +p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs) === x0 ? x0 + 1 : Math.max(...xs);
+  const ymin = Math.min(0, ...ys), ymax = Math.max(...ys) === ymin ? ymin + 1 : Math.max(...ys) * 1.06;
+  const sx = (x) => L + ((x - x0) / (x1 - x0)) * (W - L - R), sy = (y) => T + (1 - (y - ymin) / (ymax - ymin)) * (H - T - B);
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": v.title || "" });
+  for (let k = 0; k <= 4; k++) {
+    const yv = ymin + ((ymax - ymin) * k) / 4, y = sy(yv);
+    svg.append(svgEl("line", { x1: L, x2: W - R, y1: y, y2: y, class: Math.abs(yv) < 1e-12 ? "baseline" : "gridline" }));
+    svg.append(svgText({ x: L - 4, y: y + 3, "text-anchor": "end", class: "axis-label" }, fmt(yv, Math.abs(ymax) < 2 ? 2 : 1)));
   }
-  const xl = svgEl("text", { x: W - R, y: H - 4, "text-anchor": "end", class: "axis-label" }); xl.textContent = `第 ${x1} 段`; svg.append(xl);
-  svg.append(svgEl("path", { d: pts.map((p, i) => `${i ? "L" : "M"}${sx(p.x)},${sy(p.y)}`).join(""), fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round" }));
-  const last = pts[pts.length - 1];
-  svg.append(svgEl("circle", { cx: sx(last.x), cy: sy(last.y), r: 4, fill: color, stroke: "var(--surface)", "stroke-width": 2 }));
-  const cross = svgEl("line", { y1: T, y2: H - B, stroke: "var(--axis)", "stroke-width": 1, visibility: "hidden" });
-  const dot = svgEl("circle", { r: 4, fill: color, stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" });
-  svg.append(cross, dot);
+  const xd = xs.every((x) => Number.isInteger(x)) ? 0 : 2;
+  svg.append(svgText({ x: L, y: H - 6, class: "axis-label" }, fmt(x0, xd)), svgText({ x: W - R, y: H - 6, "text-anchor": "end", class: "axis-label" }, `${fmt(x1, xd)}  ${v.x || ""}`));
+  series.forEach((s, i) => {
+    svg.append(svgEl("path", { d: s.points.map((p, j) => `${j ? "L" : "M"}${sx(+p[0])},${sy(+p[1])}`).join(""), fill: "none", stroke: SERIES[i], "stroke-width": 2, "stroke-linejoin": "round" }));
+    if (s.points.length < 30) s.points.forEach((p) => svg.append(svgEl("circle", { cx: sx(+p[0]), cy: sy(+p[1]), r: 3, fill: SERIES[i], stroke: "var(--surface)", "stroke-width": 1.5 })));
+  });
+  const cross = svgEl("line", { y1: T, y2: H - B, stroke: "var(--axis)", visibility: "hidden" });
+  svg.append(cross);
   const hit = svgEl("rect", { x: L, y: T, width: W - L - R, height: H - T - B, fill: "transparent" });
   hit.addEventListener("mousemove", (e) => {
     const r = svg.getBoundingClientRect(), mx = ((e.clientX - r.left) / r.width) * W;
-    const p = pts.reduce((a, b) => (Math.abs(sx(b.x) - mx) < Math.abs(sx(a.x) - mx) ? b : a));
-    cross.setAttribute("x1", sx(p.x)); cross.setAttribute("x2", sx(p.x)); cross.setAttribute("visibility", "visible");
-    dot.setAttribute("cx", sx(p.x)); dot.setAttribute("cy", sy(p.y)); dot.setAttribute("visibility", "visible");
-    showTip(e, `第 ${p.x} 段<br>${name} <b>${fmt(p.y)}</b>${p.label ? `<br><span class="k">${esc(p.label)}</span>` : ""}`);
+    const xsAll = [...new Set(all.map((p) => +p[0]))];
+    const xv = xsAll.reduce((a, b) => (Math.abs(sx(b) - mx) < Math.abs(sx(a) - mx) ? b : a));
+    cross.setAttribute("x1", sx(xv)); cross.setAttribute("x2", sx(xv)); cross.setAttribute("visibility", "visible");
+    const rows = series.map((s, i) => { const p = s.points.find((q) => +q[0] === xv); return p ? `<div><span style="color:${SERIES[i]}">●</span> ${esc(s.name)} <b>${fmt(p[1])}</b></div>` : ""; }).join("");
+    showTip(e, `<div class="k">${esc(v.x || "x")} = ${fmt(xv, 2)}</div>${rows}`);
   });
-  hit.addEventListener("mouseleave", () => { cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); hideTip(); });
+  hit.addEventListener("mouseleave", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
   svg.append(hit);
-  node.append(svg);
+  wrap.append(svg);
+  return wrap;
 }
 
-// ---------- heatmap (rows = layers) ----------
-function heatmap(node, grid, { cols = null, colName = "头", unit = "" } = {}) {
-  node.replaceChildren();
-  if (!grid || !grid.length) { node.append(el("div", { class: "empty" }, "无（未启用）")); return; }
-  const nr = grid.length, nc = grid[0].length, max = Math.max(...grid.flat(), 1e-9);
-  const W = 300, L = 26, T = cols ? 34 : 4, cw = (W - L) / nc, ch = Math.max(5, Math.min(12, 220 / nr)), H = T + nr * ch + 14;
+function barsChart(v) {
+  const wrap = el("div", { class: "chart" }, el("h3", {}, v.title || ""));
+  const items = v.items || [];
+  if (!items.length) return wrap;
+  const W = 560, H = 150, L = 40, R = 6, T = 8, B = 20;
+  const vals = items.map((x) => +x[1]), lo = Math.min(0, ...vals), hi = Math.max(0, ...vals) || 1;
+  const sy = (y) => T + (1 - (y - lo) / (hi - lo || 1)) * (H - T - B), bw = (W - L - R) / items.length;
   const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  [lo, (lo + hi) / 2, hi].forEach((yv) => svg.append(svgText({ x: L - 4, y: sy(yv) + 3, "text-anchor": "end", class: "axis-label" }, fmt(yv, 2))));
+  svg.append(svgEl("line", { x1: L, x2: W - R, y1: sy(0), y2: sy(0), class: "baseline" }));
+  const signed = lo < 0;
+  items.forEach(([label, val], i) => {
+    const y0 = sy(0), y1 = sy(+val), x = L + i * bw + 1;
+    const r = svgEl("rect", { x, y: Math.min(y0, y1), width: Math.max(bw - 2, 1), height: Math.max(Math.abs(y1 - y0), 1), rx: Math.min(3, bw / 4),
+      fill: signed ? (+val < 0 ? "var(--div-pos)" : "var(--div-neg)") : "var(--series-1)" });
+    hover(r, `${esc(label)}<br><b>${fmt(val)}</b>`);
+    svg.append(r);
+    if (items.length <= 16 || i % Math.ceil(items.length / 12) === 0) svg.append(svgText({ x: x + bw / 2, y: H - 6, "text-anchor": "middle", class: "axis-label" }, String(label).slice(0, 8)));
+  });
+  wrap.append(svg);
+  return wrap;
+}
+
+function heatmapChart(v, onClick) {
+  const wrap = el("div", { class: "chart" }, el("h3", {}, v.title || ""));
+  const grid = v.grid || [];
+  if (!grid.length) return wrap;
+  const nr = grid.length, nc = grid[0].length, flat = grid.flat();
+  const amax = Math.max(...flat.map(Math.abs), 1e-9);
+  const W = 560, L = 26, T = 4, cw = (W - L) / nc, ch = Math.max(6, Math.min(14, 300 / nr)), H = T + nr * ch + 16;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  const marks = new Set((v.marks || []).map(([a, b]) => `${a},${b}`));
   grid.forEach((row, i) => {
-    row.forEach((v, j) => {
-      const c = svgEl("rect", { x: L + j * cw + 1, y: T + i * ch + 1, width: Math.max(cw - 2, 1), height: ch - 2, rx: 1.5,
-        fill: "var(--heat)", "fill-opacity": (0.06 + 0.94 * (v / max)).toFixed(3) });
-      c.addEventListener("mousemove", (e) => showTip(e, `第 ${i} 层 · ${colName} ${cols ? cols[j] : j}<br><b>${fmt(v, 4)}</b>${unit}<br><span class="k">最大 ${fmt(max, 4)}</span>`));
-      c.addEventListener("mouseleave", hideTip);
+    row.forEach((val, j) => {
+      const t = Math.abs(val) / amax;
+      const fill = v.diverging ? (val < 0 ? "var(--div-pos)" : "var(--div-neg)") : "var(--heat)";
+      const c = svgEl("rect", { x: L + j * cw + 1, y: T + i * ch + 1, width: Math.max(cw - 2, 1), height: ch - 2, rx: 1.5, fill, "fill-opacity": (0.05 + 0.95 * t).toFixed(3), class: onClick ? "cell" : "" });
+      if (marks.has(`${i},${j}`)) { c.setAttribute("stroke", "var(--ink)"); c.setAttribute("stroke-width", 1.5); }
+      hover(c, () => `第 ${i} ${v.rows || "行"} · ${v.cols || "列"} ${j}<br><b>${fmt(val)}</b>${marks.has(`${i},${j}`) ? "<br>已关闭" : ""}${onClick ? '<br><span class="k">点击：开/关</span>' : ""}`);
+      if (onClick) c.addEventListener("click", () => onClick(i, j));
       svg.append(c);
     });
-    if (i % Math.ceil(nr / 6) === 0) { const t = svgEl("text", { x: L - 4, y: T + i * ch + ch - 2, "text-anchor": "end", class: "axis-label" }); t.textContent = i; svg.append(t); }
+    if (i % Math.ceil(nr / 8) === 0) svg.append(svgText({ x: L - 4, y: T + i * ch + ch - 2, "text-anchor": "end", class: "axis-label" }, i));
   });
-  if (cols) cols.forEach((c, j) => { const t = svgEl("text", { x: L + j * cw + cw / 2, y: T - 4, "text-anchor": "middle", class: "axis-label" }); t.textContent = c.replace("att.", "").replace("ffn.", "f.").replace("receptance", "r"); svg.append(t); });
-  const lab = svgEl("text", { x: L, y: H - 2, class: "axis-label" }); lab.textContent = `↓ 层（0–${nr - 1}）  颜色越深数值越大，悬停看数值`; svg.append(lab);
-  node.append(svg);
+  svg.append(svgText({ x: L, y: H - 3, class: "axis-label" }, `↓ ${v.rows || "行"} 0–${nr - 1}   → ${v.cols || "列"} 0–${nc - 1}   ${v.diverging ? "红 = 变低（这里重要）  蓝 = 变高" : "颜色越深数值越大"}`));
+  wrap.append(svg);
+  return wrap;
 }
 
-function renderMemory(m) {
-  if (!m) return;
-  heatmap($("#hm-working"), m.working);
-  heatmap($("#hm-drift"), m.drift);
-  heatmap($("#hm-lora"), m.lora, { cols: m.lora_modules, colName: "模块" });
+function tilesView(v) {
+  return el("div", { class: "tiles" }, (v.items || []).map(([k, val, note]) => el("div", { class: "tile" }, el("div", { class: "k" }, k), el("div", { class: String(val).length > 14 ? "v long" : "v" }, String(val)), el("div", { class: "n" }, note || ""))));
+}
+function tableView(v) {
+  return el("div", { class: "chart" }, el("h3", {}, v.title || ""), el("div", { class: "tablewrap" }, el("table", { class: "t" },
+    el("thead", {}, el("tr", {}, (v.columns || []).map((c) => el("th", {}, c)))),
+    el("tbody", {}, (v.rows || []).map((r) => el("tr", {}, r.map((c) => el("td", { class: typeof c === "number" ? "num" : "" }, typeof c === "number" ? fmt(c) : String(c ?? "")))))))));
+}
+function textsView(v) {
+  return el("div", { class: "chart" }, el("h3", {}, v.title || ""), el("div", { class: "texts" },
+    (v.items || []).map((t) => el("div", { class: "tx" }, el("b", {}, t.title || ""), t.text || "", el("span", { class: "n" }, t.note || "")))));
 }
 
-// ---------- state ----------
-const S = { lossPts: [], klPts: [], chunk: 0, info: null, rounds: [], probes: [], baseline: null };
-
-function addLearnPoints(d, label) {
-  if (d.tokens) { S.chunk += 1; S.lossPts.push({ x: S.chunk, y: d.loss, label }); }
-  if (d.kl != null) S.klPts.push({ x: S.chunk, y: d.kl, label });
-}
-function renderLearnCharts() {
-  lineChart($("#loss-chart"), S.lossPts, { name: "损失" });
-  $("#kl-figure").hidden = !S.klPts.length;
-  if (S.klPts.length) lineChart($("#kl-chart"), S.klPts, { name: "锚定 KL", color: "var(--series-2)" });
-}
-
-async function learn(body, label) {
-  $("#learn-status").textContent = "学习中…";
-  body.epochs = +$("#epochs").value || 1;
-  body.label = label;
-  await api.stream("/api/learn", body, (e) => {
-    if (e.chunk) { addLearnPoints(e.chunk, label); renderLearnCharts(); }
-    if (e.done) $("#learn-status").textContent = `完成：${e.done.tokens} token，损失 ${fmt(e.done.loss_first, 2)} → ${fmt(e.done.loss_last, 2)}，${e.done.seconds}s`;
-    if (e.round) { S.rounds.push(e.round); renderProbes(); }
-    if (e.memory) renderMemory(e.memory);
-    if (e.error) $("#learn-status").textContent = "出错：" + e.error;
+function renderViz(list, ctx) {
+  return (list || []).map((v) => {
+    const card = el("div", { class: "card" });
+    if (v.type === "metrics") card.append(tilesView(v));
+    else if (v.type === "line") card.append(lineChart(v));
+    else if (v.type === "bars") card.append(barsChart(v));
+    else if (v.type === "table") card.append(tableView(v));
+    else if (v.type === "texts") card.append(textsView(v));
+    else if (v.type === "heatmap") card.append(heatmapChart(v, v.click ? (i, j) => ctx.act(v.click, { row: i, col: j }, v, card) : null));
+    return card;
   });
 }
 
-// ---------- chat ----------
-const tint = () => $("#tint").checked;
-function addUser(text) { const m = el("div", { class: "msg user" }, text); $("#messages").append(m); m.scrollIntoView({ block: "end" }); }
+// ---------- labs ----------
+const S = { labs: [], current: null };
+const store = (id) => JSON.parse(localStorage.getItem("molt.lab." + id) || "{}");
+const save = (id, v) => localStorage.setItem("molt.lab." + id, JSON.stringify(v));
 
-async function send(text) {
-  addUser(text);
-  const body = el("div", { class: "body" }), meta = el("div", { class: "meta" });
-  const msg = el("div", { class: "msg bot" }, body, meta);
-  $("#messages").append(msg);
-  const toks = [];
-  $("#send").disabled = true;
-  let pending = [];
-  await api.stream("/api/chat", { prompt: text, think: $("#think").checked }, (e) => {
-    if (e.memory) return renderMemory(e.memory);
-    if (e.done) {
-      meta.append(`${toks.length} token · 平均意外度 ${fmt(toks.reduce((a, t) => a - Math.log(Math.max(t.p || 1, 1e-9)), 0) / Math.max(toks.length, 1), 2)}`,
-        el("button", { class: "ghost", onclick: () => fixUI(msg, text, e.text) }, "改写并学习"),
-        el("button", { class: "ghost", onclick: () => learn({ user: text, assistant: e.text }, "强化：" + text.slice(0, 20)) }, "强化这条"));
-      return;
-    }
-    if (e.error) { meta.append("出错：" + e.error); return; }
-    // a token without visible text (first half of a split UTF-8 character) is merged into the token that completes it
-    pending.push(e);
-    if (!e.text) return;
-    const t = { text: e.text, p: pending.reduce((a, x) => a * (x.p ?? 1), 1), top: pending[0].top };
-    pending = [];
-    toks.push(t);
-    body.append(tokenSpan(t, tint() ? surpriseBg(-Math.log(Math.max(t.p ?? 1, 1e-9))) : "transparent"));
-    msg.scrollIntoView({ block: "end" });
-  });
-  msg._toks = toks;
-  $("#send").disabled = false;
+function knob(p, values, onLive) {
+  const id = "k-" + p.name, wrap = el("div", { class: "knob" + (p.live ? " live" : "") });
+  const val = el("span", { class: "val" });
+  let input;
+  const show = (x) => { val.textContent = p.kind === "float" ? fmt(x, Math.abs(x) < 0.01 ? 5 : 3) : p.kind === "int" ? String(x) : ""; };
+  if (p.kind === "float" || p.kind === "int") {
+    const toS = (x) => (p.log ? Math.log(x) : x), fromS = (s) => (p.log ? Math.exp(s) : s);
+    const lo = toS(p.min), hi = toS(p.max);
+    input = el("input", { id, type: "range", min: lo, max: hi, step: p.log ? (hi - lo) / 200 : p.step || (hi - lo) / 200 });
+    input.value = toS(values[p.name]);
+    input.addEventListener("input", () => { let x = fromS(+input.value); if (p.kind === "int") x = Math.round(x); values[p.name] = x; show(x); if (p.live) onLive(); });
+  } else if (p.kind === "choice") {
+    input = el("select", { id }, p.choices.map((c) => el("option", { value: c, selected: c === values[p.name] }, c)));
+    input.addEventListener("change", () => { values[p.name] = input.value; if (p.live) onLive(); });
+  } else if (p.kind === "bool") {
+    input = el("input", { id, type: "checkbox", checked: !!values[p.name] });
+    input.addEventListener("change", () => { values[p.name] = input.checked; });
+  } else {
+    input = el("textarea", { id, rows: Math.min(10, String(values[p.name] ?? "").split("\n").length + 1) });
+    input.value = values[p.name] ?? "";
+    input.addEventListener("input", () => { values[p.name] = input.value; });
+  }
+  show(values[p.name]);
+  const srch = (p.kind === "float" || p.kind === "int" || p.kind === "choice") && !p.live
+    ? el("label", { class: "srch", title: "自动优化时搜索这个旋钮" }, el("input", { type: "checkbox", "data-search": p.name, checked: p.search }), "搜索") : null;
+  wrap.append(el("label", { for: id }, el("span", {}, p.label), el("span", {}, val, srch ? " " : "", srch || "")), input, p.help ? el("div", { class: "help" }, p.help) : "");
+  return wrap;
 }
 
-function fixUI(msg, user, reply) {
-  if (msg.querySelector(".fix")) return;
-  const ta = el("textarea", { rows: 3 }); ta.value = reply;
-  const box = el("div", { class: "fix" }, ta, el("div", { class: "row" },
-    el("button", { onclick: async () => { box.remove(); await learn({ user, assistant: ta.value }, "纠正：" + user.slice(0, 20)); } }, "用改写后的回答学习"),
-    el("button", { class: "ghost", onclick: () => box.remove() }, "取消")));
-  msg.append(box);
-  ta.focus();
+const EXTRAS = {
+  inject: [["LoRA 强度扫描", "dial_sweep"]],
+  surgery: [["复位所有头", "reset"]],
+};
+
+function labView(schema) {
+  const values = Object.assign(Object.fromEntries(schema.params.map((p) => [p.name, p.default])), store(schema.id));
+  const progress = el("div", { class: "card", hidden: true }, el("h3", {}, "进度"), el("div", { class: "log" }), el("div", { class: "pchart" }));
+  const liveBox = el("div", { class: "results" }), optBox = el("div"), resBox = el("div", { class: "results" });
+  const ctx = {
+    async act(action, payload, viz, card) {
+      const r = await api.post(`/api/labs/${schema.id}/act`, { action, values, payload });
+      if (r.marks && viz) { viz.marks = r.marks; card.replaceChildren(heatmapChart(viz, (i, j) => ctx.act(action, { row: i, col: j }, viz, card))); }
+      if (r.viz) liveBox.replaceChildren(...renderViz(r.viz, ctx));
+      refreshIV();
+    },
+  };
+  let liveTimer = null, liveBusy = false;
+  const onLive = () => {
+    save(schema.id, values);
+    clearTimeout(liveTimer);
+    liveTimer = setTimeout(async () => {
+      if (liveBusy) return onLive();
+      liveBusy = true;
+      try { const r = await api.post(`/api/labs/${schema.id}/live`, { values }); if (r.viz) liveBox.replaceChildren(...renderViz(r.viz, ctx)); refreshIV(); }
+      finally { liveBusy = false; }
+    }, 250);
+  };
+  const knobs = el("div", { class: "card knobs" }, schema.params.map((p) => knob(p, values, onLive)));
+  const trials = el("input", { type: "number", value: 8, min: 2, max: 64, title: "试验次数" });
+  const runBtn = el("button", {}, "运行"), optBtn = el("button", { class: "ghost" }, "自动优化");
+  const extras = (EXTRAS[schema.id] || []).map(([label, action]) => el("button", { class: "ghost", onclick: () => ctx.act(action, {}) }, label));
+  knobs.append(el("div", { class: "actions" }, runBtn, optBtn, trials, el("span", { class: "muted small" }, "次"), extras),
+    el("div", { class: "objective" }, "优化目标：" + schema.objective));
+
+  const busy = (b) => { runBtn.disabled = optBtn.disabled = b; };
+  const startProgress = () => {
+    progress.hidden = false;
+    const log = $(".log", progress), pchart = $(".pchart", progress);
+    log.textContent = ""; pchart.replaceChildren();
+    const curve = [];
+    return (e) => {
+      if (e.log) { log.textContent += e.log + "\n"; log.scrollTop = 1e9; }
+      if (e.trial_progress?.log) { log.textContent += `[试验 ${e.trial_progress.trial}] ${e.trial_progress.log}\n`; log.scrollTop = 1e9; }
+      if (e.chunk && e.chunk.tokens) { curve.push([curve.length + 1, e.chunk.loss]); pchart.replaceChildren(lineChart({ title: "训练损失（实时）", x: "步", series: [{ name: "loss", points: curve }] })); }
+      if (e.error) log.textContent += "出错：" + e.error + "\n";
+      if (e.interventions) showIV(e.interventions);
+    };
+  };
+  runBtn.onclick = async () => {
+    save(schema.id, values); busy(true); optBox.replaceChildren();
+    const on = startProgress();
+    await api.stream(`/api/labs/${schema.id}/run`, { values }, (e) => { on(e); if (e.result) resBox.replaceChildren(...renderViz(e.result.viz, ctx)); });
+    busy(false);
+  };
+  optBtn.onclick = async () => {
+    save(schema.id, values);
+    const search = [...knobs.querySelectorAll("[data-search]")].filter((x) => x.checked).map((x) => x.dataset.search);
+    if (!search.length) { alert("先勾选至少一个要搜索的旋钮"); return; }
+    busy(true);
+    const on = startProgress(), rows = [];
+    const chart = el("div"), table = el("div");
+    optBox.replaceChildren(el("div", { class: "card" }, el("h3", {}, `自动优化：搜索 ${search.join("、")}（前一半随机探索，后一半在最优附近细化）`), chart, table));
+    const draw = (bestTrial) => {
+      chart.replaceChildren(lineChart({ title: "每次试验的得分", x: "试验", series: [{ name: "得分", points: rows.map((r) => [r.trial, r.score]) }] }));
+      table.replaceChildren(el("div", { class: "tablewrap" }, el("table", { class: "t" },
+        el("thead", {}, el("tr", {}, el("th", {}, "#"), search.map((s) => el("th", {}, s)), el("th", {}, "得分"), el("th", {}, "指标"))),
+        el("tbody", {}, rows.map((r) => el("tr", { class: r.trial === bestTrial ? "best" : "" }, el("td", {}, r.trial),
+          search.map((s) => el("td", { class: "num" }, typeof r.values[s] === "number" ? fmt(r.values[s], 4) : r.values[s])),
+          el("td", { class: "num" }, fmt(r.score)), el("td", { class: "small muted" }, Object.entries(r.metrics || {}).map(([k, v]) => `${k} ${fmt(v, 2)}`).join("  "))))))));
+    };
+    await api.stream(`/api/labs/${schema.id}/optimize`, { values, search, trials: +trials.value }, (e) => {
+      on(e);
+      if (e.trial) { rows.push(e.trial); draw(e.best?.trial); }
+      if (e.result) {
+        resBox.replaceChildren(...renderViz(e.result.viz, ctx));
+        const best = e.result.optimized?.best || {};
+        Object.assign(values, best); save(schema.id, values);
+        knobs.replaceWith(labView(schema).querySelector(".knobs"));  // move the sliders to the best values
+        on({ log: "最优设置已应用到模型：" + Object.entries(best).map(([k, v]) => `${k}=${typeof v === "number" ? fmt(v, 4) : v}`).join("，") });
+      }
+    });
+    busy(false);
+  };
+  if (schema.last?.viz) resBox.replaceChildren(...renderViz(schema.last.viz, ctx));
+  return el("div", { class: "lab" }, el("div", { class: "lab-head" }, el("h2", {}, schema.title), el("p", {}, schema.summary)),
+    knobs, el("div", { class: "results" }, progress, liveBox, optBox, resBox));
 }
 
-$("#tint").addEventListener("change", () => {
-  document.querySelectorAll(".msg.bot").forEach((m) => {
-    (m._toks || []).forEach((t, i) => { const s = m.querySelectorAll(".tok")[i]; if (s) s.style.background = tint() ? surpriseBg(-Math.log(Math.max(t.p ?? 1, 1e-9))) : "transparent"; });
-  });
-});
-$("#chat-form").addEventListener("submit", (e) => { e.preventDefault(); const t = $("#prompt").value.trim(); if (!t) return; $("#prompt").value = ""; send(t); });
-$("#prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#chat-form").requestSubmit(); } });
-$("#btn-reset").addEventListener("click", async () => { renderMemory(await api.post("/api/reset", { mode: "ego" })); $("#messages").append(el("div", { class: "muted hint" }, "— 工作记忆已清空，学到的东西还在 —")); });
-$("#btn-teach").addEventListener("click", () => { const t = $("#teach-text").value.trim(); if (t) learn({ text: t }, "文字：" + t.slice(0, 20)); });
+// ---------- chat lab ----------
+const SURPRISE = [[0.5, 0], [1.5, 18], [3, 34], [5, 52], [Infinity, 70]];
+const surpriseBg = (loss) => { const a = SURPRISE.find(([hi]) => loss < hi)[1]; return a ? `color-mix(in srgb, var(--seq-400) ${a}%, transparent)` : "transparent"; };
+function chatView() {
+  const msgs = el("div", { class: "messages" });
+  const prompt = el("textarea", { rows: 2, placeholder: "说点什么…（Enter 发送，Shift+Enter 换行）" });
+  const think = el("input", { type: "checkbox" });
+  const dialVal = el("span", { class: "val" }, "1.00");
+  const dial = el("input", { type: "range", min: 0, max: 2, step: 0.05, value: 1 });
+  dial.addEventListener("input", async () => { dialVal.textContent = (+dial.value).toFixed(2); await api.post("/api/dial", { value: +dial.value }); refreshIV(); });
+  const teach = el("textarea", { rows: 3, placeholder: "教它一段文字" });
+  const status = el("div", { class: "muted small" });
+  const learn = async (body, label) => {
+    status.textContent = "学习中…";
+    await api.stream("/api/learn", { ...body, epochs: 3, label }, (e) => {
+      if (e.done) status.textContent = `学完：${e.done.tokens} token，损失 ${fmt(e.done.loss_first, 2)} → ${fmt(e.done.loss_last, 2)}`;
+      if (e.error) status.textContent = "出错：" + e.error;
+    });
+  };
+  const send = async (text) => {
+    msgs.append(el("div", { class: "msg user" }, text));
+    const body = el("div"), meta = el("div", { class: "meta" }), msg = el("div", { class: "msg bot" }, body, meta);
+    msgs.append(msg);
+    let pending = [], n = 0, sur = 0;
+    await api.stream("/api/chat", { prompt: text, think: think.checked }, (e) => {
+      if (e.done) {
+        meta.append(`${n} token · 平均意外度 ${fmt(sur / Math.max(n, 1), 2)}`,
+          el("button", { class: "ghost", onclick: () => {
+            const ta = el("textarea", { rows: 3 }); ta.value = e.text;
+            msg.append(el("div", { class: "composer" }, ta, el("div", { class: "row" }, el("button", { onclick: () => learn({ user: text, assistant: ta.value }, "纠正") }, "用改写后的回答学习"))));
+          } }, "改写并学习"));
+        return;
+      }
+      if (e.memory || e.text == null) return;
+      pending.push(e);
+      if (!e.text) return;
+      const p = pending.reduce((a, x) => a * (x.p ?? 1), 1), top = pending[0].top || [];
+      pending = [];
+      const s = el("span", { class: "tok" }, e.text);
+      s.style.background = surpriseBg(-Math.log(Math.max(p, 1e-9)));
+      hover(s, `“${esc(e.text)}” p=${(p * 100).toFixed(1)}%<div class="k">模型的前几名候选</div>${top.map(([w, q]) => `${esc(w)} <span class="k">${(q * 100).toFixed(1)}%</span>`).join("<br>")}`);
+      body.append(s); n++; sur += -Math.log(Math.max(p, 1e-9));
+      msgs.scrollTop = 1e9;
+    });
+  };
+  prompt.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); const t = prompt.value.trim(); if (t) { prompt.value = ""; send(t); } } });
+  return el("div", { class: "lab" },
+    el("div", { class: "lab-head" }, el("h2", {}, "自由对话"), el("p", {}, "和当前模型（含所有干预与学到的东西）对话。token 底色越深越出乎模型意料；任何回答都能改写后立即学习。")),
+    el("div", { class: "card knobs" },
+      el("div", { class: "knob live" }, el("label", {}, el("span", {}, "LoRA 强度（全局）"), dialVal), dial, el("div", { class: "help" }, "0 = 学习前的模型，1 = 学到的样子")),
+      el("label", { class: "small" }, think, " 思考模式"),
+      el("button", { class: "ghost", onclick: async () => { await api.post("/api/reset", { mode: "ego" }); msgs.append(el("div", { class: "muted small" }, "— 工作记忆已清空 —")); } }, "清空工作记忆"),
+      el("h3", {}, "教它一段文字"), teach, el("button", { onclick: () => teach.value.trim() && learn({ text: teach.value.trim() }, "文字") }, "学习"), status),
+    el("div", { class: "card" }, msgs, el("div", { class: "composer" }, prompt)));
+}
 
-// ---------- probes ----------
-function sparkline(vals) {
-  const v = vals.filter((x) => x != null);
-  if (v.length < 2) return el("span", { class: "muted" }, "—");
-  const W = 70, H = 20, max = Math.max(...v), min = Math.min(...v), sx = (i) => 2 + (i / (v.length - 1)) * (W - 4), sy = (y) => H - 3 - ((y - min) / (max - min || 1)) * (H - 6);
-  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H });
-  svg.append(svgEl("path", { d: v.map((y, i) => `${i ? "L" : "M"}${sx(i)},${sy(y)}`).join(""), fill: "none", stroke: "var(--series-1)", "stroke-width": 1.5 }));
-  svg.append(svgEl("circle", { cx: sx(v.length - 1), cy: sy(v.at(-1)), r: 2.5, fill: "var(--series-1)" }));
-  const t = svgEl("title"); t.textContent = v.map((x) => x.toFixed(2)).join(" → "); svg.append(t);
-  return svg;
+// ---------- interventions status ----------
+function showIV(iv) {
+  const off = iv.head_scale.flat().filter((x) => x === 0).length;
+  const dec = iv.decay_scale.flat().filter((x) => Math.abs(x - 1) > 1e-3).length;
+  const st = iv.steer_norm.filter((x) => x > 0).length;
+  $("#iv-status").textContent = off || dec || st ? `当前干预：关闭头 ${off} · 改衰减的头 ${dec} · 操控层 ${st}` : "无干预";
 }
-function renderProbes() {
-  const rows = S.probes.map((p) => {
-    const hist = S.rounds.map((r) => r.results.find((x) => x.id === p.id)).filter(Boolean);
-    const last = hist.at(-1), first = hist[0];
-    const losses = hist.map((h) => h.loss);
-    let delta = "";
-    if (last?.loss != null && first?.loss != null && hist.length > 1) {
-      const d = last.loss - first.loss;
-      delta = Math.abs(d) < 0.05 ? " ≈" : d < 0 ? ` ↓${(-d).toFixed(2)}（更熟）` : ` ↑${d.toFixed(2)}（被干扰）`;
-    }
-    const changed = first && last && hist.length > 1 && first.answer !== last.answer;
-    return el("tr", {},
-      el("td", {}, p.prompt, p.expect ? el("div", { class: "muted" }, "期望：" + p.expect) : ""),
-      el("td", { class: "num" }, last?.loss != null ? fmt(last.loss, 2) + delta : "—"),
-      el("td", {}, sparkline(losses)),
-      el("td", { class: "ans" }, last ? last.answer : "—", changed ? el("span", { class: "badge", title: "首轮回答：" + first.answer }, "回答变了") : ""),
-      el("td", {}, el("button", { class: "ghost", title: "删除", onclick: async () => { const r = await api.post("/api/probes", { action: "remove", id: p.id }); S.probes = r.probes; renderProbes(); } }, "×")));
-  });
-  $("#probe-rows").replaceChildren(...rows);
-}
-$("#probe-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const r = await api.post("/api/probes", { action: "add", prompt: $("#probe-q").value, expect: $("#probe-a").value });
-  $("#probe-q").value = $("#probe-a").value = ""; S.probes = r.probes; renderProbes();
-});
-$("#btn-eval").addEventListener("click", async () => {
-  $("#btn-eval").disabled = true;
-  const r = await api.post("/api/probes", { action: "eval" }); S.probes = r.probes; S.rounds = r.rounds; renderProbes();
-  $("#btn-eval").disabled = false;
-});
+const refreshIV = async () => showIV(await api.get("/api/interventions"));
 
-// ---------- microscope ----------
-async function analyze() {
-  const text = $("#scope-text").value;
-  if (!text.trim()) return null;
-  return api.post("/api/tokens", { text, from: "ego" });
+// ---------- shell ----------
+function select(id) {
+  S.current = id;
+  document.querySelectorAll(".nav button").forEach((b) => b.classList.toggle("on", b.dataset.id === id));
+  $("#view").replaceChildren(id === "chat" ? chatView() : labView(S.labs.find((l) => l.id === id)));
+  location.hash = id;
 }
-function renderScope(toks, compare) {
-  const out = $("#scope-out"); out.replaceChildren();
-  for (const t of toks) out.append(tokenSpan(t, compare ? deltaBg(t.delta) : surpriseBg(t.loss)));
-  const mean = toks.reduce((a, t) => a + t.loss, 0) / Math.max(toks.length, 1);
-  out.append(el("div", { class: "muted hint" }, compare
-    ? `平均损失 ${fmt(toks.reduce((a, t) => a + t.before, 0) / toks.length, 2)} → ${fmt(mean, 2)}`
-    : `平均损失 ${fmt(mean, 2)}（${toks.length} token）`));
-  legend($("#scope-legend"), compare ? DELTA_BINS.map(([hi, c, a, l]) => [c ? `color-mix(in srgb, ${c} ${a}%, transparent)` : "transparent", l])
-    : [[surpriseBg(0.1), "很确定"], [surpriseBg(2), "一般"], [surpriseBg(9), "很意外"]]);
-}
-$("#btn-scope").addEventListener("click", async () => { const t = await analyze(); if (t) renderScope(t, false); });
-$("#btn-baseline").addEventListener("click", async () => {
-  const t = await analyze(); if (!t) return;
-  S.baseline = { text: $("#scope-text").value, toks: t }; renderScope(t, false);
-  $("#btn-compare").disabled = false; $("#btn-baseline").textContent = "基线已设";
-});
-$("#btn-compare").addEventListener("click", async () => {
-  if (!S.baseline || S.baseline.text !== $("#scope-text").value) { alert("文字和基线不一致，请先重新设为基线"); return; }
-  const t = await analyze();
-  t.forEach((x, i) => { x.before = S.baseline.toks[i].loss; x.delta = x.loss - x.before; });
-  renderScope(t, true);
-});
-
-// ---------- settings ----------
-$("#btn-settings").addEventListener("click", () => { const s = $("#settings"); s.hidden = !s.hidden; $("#btn-settings").setAttribute("aria-expanded", String(!s.hidden)); });
 $("#btn-theme").addEventListener("click", () => {
   const r = document.documentElement, dark = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
   r.dataset.theme = dark ? "light" : "dark";
 });
-document.querySelectorAll("[data-cfg]").forEach((inp) => inp.addEventListener("change", async () => {
-  const [grp, key] = inp.dataset.cfg.split(".");
-  S.info = await api.post("/api/config", { [grp]: { [key]: +inp.value } });
-}));
-$("#btn-anchors").addEventListener("click", async () => {
-  $("#anchor-status").textContent = "生成中…";
-  const r = await api.post("/api/anchors", { prompts: $("#anchor-prompts").value.split("\n") });
-  $("#anchor-status").textContent = `${r.anchors} 个锚点`;
-});
-$("#btn-save").addEventListener("click", async () => { await api.post("/api/save", { path: $("#mem-path").value }); alert("已保存"); });
-$("#btn-load").addEventListener("click", async () => { renderMemory(await api.post("/api/load", { path: $("#mem-path").value })); alert("已载入"); });
-$("#btn-mem").addEventListener("click", async () => renderMemory(await api.get("/api/memory")));
+$("#btn-iv-reset").addEventListener("click", async () => showIV(await api.post("/api/interventions/reset")));
+$("#btn-forget").addEventListener("click", async () => { if (confirm("把 LoRA 和 ego 恢复到从未训练的状态？")) { await api.post("/api/memory/restore"); alert("已恢复"); } });
 
-// ---------- boot ----------
 (async () => {
-  const info = (S.info = await api.get("/api/info"));
-  $("#model-info").textContent = `${info.variant} · ${info.n_layer} 层 × ${info.n_embd} · LoRA r=${info.lora_r} · ego ${info.tune_ego ? "可学" : "冻结"} · 锚点 ${info.anchors}`;
-  document.querySelectorAll("[data-cfg]").forEach((inp) => { const [g, k] = inp.dataset.cfg.split("."); inp.value = info[g][k]; });
-  S.probes = info.probes; S.rounds = info.rounds;
-  for (const d of info.curve || []) addLearnPoints(d, d.label);
-  $("#anchor-status").textContent = `${info.anchors} 个锚点`;
-  renderProbes(); renderLearnCharts(); renderMemory(await api.get("/api/memory"));
+  const [info, labs] = await Promise.all([api.get("/api/info"), api.get("/api/labs")]);
+  S.labs = labs;
+  $("#model-info").textContent = `${info.variant} · ${info.n_layer} 层 × ${info.n_embd} · LoRA r=${info.lora_r}`;
+  const short = { inject: "学习策略对比，测涌现", horizon: "调遗忘速度，拉长记忆", surgery: "关头、清 state，找知识", steer: "残差方向，操控行为" };
+  $("#nav").append(...labs.map((l) => el("button", { "data-id": l.id, onclick: () => select(l.id) }, l.title.split("：")[0], el("span", { class: "muted" }, short[l.id] || ""))),
+    el("button", { "data-id": "chat", onclick: () => select("chat") }, "自由对话", el("span", { class: "muted" }, "对话、改写、即时学习")));
+  const pick = () => { const want = location.hash.slice(1); return want === "chat" || labs.some((l) => l.id === want) ? want : labs[0].id; };
+  select(pick());
+  addEventListener("hashchange", () => { if (pick() !== S.current) select(pick()); });
+  refreshIV();
 })();

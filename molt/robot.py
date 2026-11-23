@@ -15,6 +15,7 @@ import json
 import math
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -85,6 +86,7 @@ class Robot:
         self._opt = None
         self.history: list[dict] = []
         self.anchors: list[list[int]] = []
+        self._fresh = self.snapshot()  # the untrained slow tiers, for restore("fresh")
 
     # ---- memory tiers -----------------------------------------------------
     @property
@@ -112,6 +114,52 @@ class Robot:
 
     def lora_parameters(self):
         return [p for n, p in self.model.named_parameters() if "lora_" in n]
+
+    # ---- snapshots of the slow tiers (labs restore them between trials) ----
+    @torch.no_grad()
+    def snapshot(self) -> dict:
+        return {"lora": {n: p.detach().clone() for n, p in self.model.named_parameters() if "lora_" in n},
+                "ego": self.ego_wkv.detach().clone()}
+
+    @torch.no_grad()
+    def restore(self, snap: dict | str = "fresh"):
+        """Put adapters and ego back to a snapshot ("fresh" = never trained); also resets the optimizer."""
+        snap = self._fresh if snap == "fresh" else snap
+        params = dict(self.model.named_parameters())
+        for n, t in snap["lora"].items():
+            params[n].copy_(t)
+        self.ego_wkv.copy_(snap["ego"])
+        self._opt = None
+        return self
+
+    @contextmanager
+    def training(self):
+        """Gradients on for the trainable tiers, model in train mode with checkpointing; undone on exit."""
+        for p in self.lora_parameters():
+            p.requires_grad_(True)
+        self.model.train()
+        self.model.grad_checkpoint = self.learn_cfg.grad_checkpoint
+        try:
+            yield self._optimizer()
+        finally:
+            self.model.eval()
+            self.model.grad_checkpoint = False
+            self.model.requires_grad_(False)
+
+    def train_step(self, loss) -> float | None:
+        """One optimizer step on a loss built inside `with robot.training():` (anchor KL added if enabled)."""
+        return self._step(loss, self._optimizer())
+
+    @torch.no_grad()
+    def ask(self, question: str, state: State | None = None, max_tokens: int = 64, think: bool = False) -> str:
+        """Greedy answer from `state` (default: ego), leaving the working state untouched."""
+        saved = self.state
+        self.state = (state if state is not None else self.ego).clone()
+        try:
+            q = f"User: {clean(question)}\n\nAssistant:" + (" <think" if think else " <think></think>")
+            return self.speak(q, cfg=SamplingConfig(temperature=0, max_tokens=max_tokens)).strip()
+        finally:
+            self.state = saved
 
     # ---- perception / action ---------------------------------------------
     @torch.no_grad()

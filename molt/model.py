@@ -75,6 +75,13 @@ class TimeMix(nn.Module):
         self.value = nn.Linear(C, C, bias=False)
         self.output = nn.Linear(C, C, bias=False)
         self.ln_x = nn.GroupNorm(self.H, C, eps=64e-5)
+        self._init_interventions()
+
+    def _init_interventions(self, device=None):
+        # decay_scale multiplies the per-head log decay: <1 remembers longer, >1 forgets faster.
+        # head_scale multiplies each head's output: 0 switches the head off.
+        self.register_buffer("decay_scale", torch.ones(self.H, device=device), persistent=False)
+        self.register_buffer("head_scale", torch.ones(self.H, device=device), persistent=False)
 
     def forward(self, x, x_prev, wkv, v_first, backend="auto"):
         B, T, C = x.shape
@@ -97,10 +104,12 @@ class TimeMix(nn.Module):
             v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)
 
         hv = lambda t: t.view(B, T, H, N)
-        o, wkv = wkv7(hv(r), hv(w).to(r.dtype), hv(k), hv(v), -kk, kk * hv(a), wkv, backend=backend)
+        w = hv(w) * self.decay_scale.float().view(1, 1, H, 1)
+        o, wkv = wkv7(hv(r), w.to(r.dtype), hv(k), hv(v), -kk, kk * hv(a), wkv, backend=backend)
 
         o = self.ln_x(o.reshape(B * T, C)).view(B, T, C)
         o = o + ((hv(r) * hv(k) * self.r_k).sum(-1, keepdim=True) * hv(v)).view(B, T, C)
+        o = (hv(o) * self.head_scale.view(1, 1, H, 1).to(o.dtype)).view(B, T, C)
         return self.output(o * g), x[:, -1], wkv, v_first
 
 
@@ -153,6 +162,39 @@ class RWKV7(nn.Module):
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.grad_checkpoint = False
         self.backend = "auto"
+        self.register_buffer("steer", torch.zeros(cfg.n_layer, cfg.n_embd), persistent=False)
+
+    # ---- interventions -----------------------------------------------------
+    # All are tensors changed in place, so a captured CUDA graph sees every change.
+    @torch.no_grad()
+    def reset_interventions(self):
+        for b in self.blocks:
+            b.att.decay_scale.fill_(1.0)
+            b.att.head_scale.fill_(1.0)
+        self.steer.zero_()
+
+    @torch.no_grad()
+    def set_decay_scale(self, layer, head=None, value=1.0):
+        t = self.blocks[layer].att.decay_scale
+        (t if head is None else t[head:head + 1]).fill_(value)
+
+    @torch.no_grad()
+    def set_head_scale(self, layer, head=None, value=1.0):
+        t = self.blocks[layer].att.head_scale
+        (t if head is None else t[head:head + 1]).fill_(value)
+
+    @torch.no_grad()
+    def set_steer(self, layer, vector=None):
+        """Add `vector` [C] to the residual stream after block `layer` (None clears it)."""
+        if vector is None:
+            self.steer[layer].zero_()
+        else:
+            self.steer[layer].copy_(vector.to(self.steer))
+
+    def interventions(self) -> dict:
+        return {"decay_scale": torch.stack([b.att.decay_scale for b in self.blocks]).float().cpu().tolist(),
+                "head_scale": torch.stack([b.att.head_scale for b in self.blocks]).float().cpu().tolist(),
+                "steer_norm": self.steer.float().norm(dim=-1).cpu().tolist()}
 
     # ---- construction ----------------------------------------------------
     @classmethod
@@ -162,7 +204,14 @@ class RWKV7(nn.Module):
         with torch.device("meta"):
             model = cls(cfg)
         model.load_state_dict(sd, strict=True, assign=True)
+        model._init_interventions_cpu()
         return model.to(device=device, dtype=dtype).eval().requires_grad_(False)
+
+    def _init_interventions_cpu(self):
+        """Buffers built on the meta device during from_pretrained are materialised here."""
+        for b in self.blocks:
+            b.att._init_interventions("cpu")
+        self.register_buffer("steer", torch.zeros(self.cfg.n_layer, self.cfg.n_embd), persistent=False)
 
     def new_state(self, batch: int = 1) -> State:
         p = self.head.weight
@@ -199,6 +248,7 @@ class RWKV7(nn.Module):
             else:
                 out = blk(*args, backend=self.backend)
             x, ax, s, fx, v_first, c = out
+            x = x + self.steer[i].to(x.dtype)
             att_xs.append(ax); wkvs.append(s); ffn_xs.append(fx); caches.append(c)
         if last_only:
             x = x[:, -1:]

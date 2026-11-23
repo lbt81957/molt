@@ -24,6 +24,9 @@ class LoRALinear(nn.Module):
         self.lora_A = nn.Parameter(torch.empty(r, base.in_features, device=dev, dtype=torch.float32))
         self.lora_B = nn.Parameter(torch.zeros(base.out_features, r, device=dev, dtype=torch.float32))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        # dial: how much of the learned update to apply (0 = before learning, 1 = as learned, >1 = amplified).
+        # A tensor changed in place, so CUDA-graph decoding sees it.
+        self.register_buffer("dial", torch.ones((), device=dev), persistent=False)
 
     @property
     def weight(self):
@@ -33,7 +36,7 @@ class LoRALinear(nn.Module):
         y = self.base(x)
         if not LoRALinear.enabled:
             return y
-        return y + ((x.float() @ self.lora_A.t()) @ self.lora_B.t() * self.scale).to(y.dtype)
+        return y + ((x.float() @ self.lora_A.t()) @ self.lora_B.t() * (self.scale * self.dial)).to(y.dtype)
 
     @torch.no_grad()
     def merged_weight(self):
@@ -48,6 +51,14 @@ class lora_disabled:
 
     def __exit__(self, *exc):
         LoRALinear.enabled = True
+
+
+@torch.no_grad()
+def set_dial(model, value: float, layers=None):
+    """Scale the learned LoRA update globally or for some layers (list of layer ids)."""
+    for n, m in model.named_modules():
+        if isinstance(m, LoRALinear) and (layers is None or int(n.split(".")[1]) in layers):
+            m.dial.fill_(value)
 
 
 def add_lora(model, r: int = 16, alpha: float = 32.0, targets=DEFAULT_TARGETS) -> list[str]:

@@ -37,24 +37,59 @@ its `listen / speak / learn` interface, and rebuilds everything else for the RWK
 - **Human-in-the-loop.** Includes an HTTP API (`molt.server`) and a terminal chat
   (`molt.chat`). In the chat, `/fix <better answer>` teaches the model your correction at once.
 
-## The workbench
+## Labs
 
 `python -m molt.server --model path.pth`, then open <http://127.0.0.1:3000>. It is a single page with no
-build step, served by the same process.
+build step, served by the same process. Each lab is a small experiment on the live model. Its knobs are
+generated from the lab's parameter schema, and knobs marked ⚡ apply instantly. **Run** measures once;
+**Auto-optimize** searches the ticked knobs: random exploration first, then refinement around the best.
+The best setting is left applied to the model.
 
-![Molt workbench](docs/screenshot.png)
+![Steering lab](docs/screenshot.png)
 
-- **Chat with token-level surprise.** Each generated token is tinted by how unexpected it was to the
-  model. Hover a token to see its probability and the model's top-5 alternatives.
-- **Correct a reply and learn from it.** Rewrite any reply and the model learns your version at once.
-  The loss curve and the anchor-KL curve update live, chunk by chunk.
-- **Probes.** A fixed set of questions, re-run after every learning step. For each one you see the
-  loss on the expected answer and its trend, plus whether the answer changed. Together they show what was
-  acquired and what was damaged.
-- **Memory maps.** Heatmaps of the working state (layer × head), how far it has drifted from ego,
-  and the LoRA update norm per layer and module.
-- **Microscope.** Paste any text to see per-token surprise. Set a baseline, learn something, then
-  compare to see the per-token Δloss.
+| lab | what you turn | what you see |
+|---|---|---|
+| **Knowledge injection** | learning strategy (`sft` / `augment` / `distill` / `sleep`), lr, epochs, anchor weight; ⚡ LoRA strength | recall, paraphrase, reverse and cross-fact composition accuracy; interference on control questions; per-question table; LoRA-strength sweep |
+| **Memory horizon** | decay scale per layer group (forget slower / faster) | pass-key retrieval vs distance (random filler, decoy keys) and the cost on ordinary text |
+| **State surgery** | switch any time-mix head off by clicking it; wipe a layer's state | how much log p(answer) drops per layer and per head, i.e. where the memory lives |
+| **Steering** | contrast examples, layer; ⚡ strength α | outputs at several α side by side, a behaviour metric and a fluency cost |
+| **Chat** | ⚡ global LoRA strength | token-level surprise with top-5 alternatives on hover; rewrite any reply and learn it |
+
+All labs act through one **intervention layer** built into the model's forward pass: per-head decay scale,
+per-head output scale, a steering vector per layer, and a LoRA strength dial. They are tensors changed in
+place, so CUDA-graph decoding sees every change. At their defaults they change nothing; the official-parity
+tests still pass bit for bit.
+
+![State surgery: wiping layers 3-4 or one head in layer 7 breaks the memory](docs/surgery.png)
+
+### Learning strategies: training on the raw message is not enough
+
+`molt/strategies.py` turns the same facts into lasting knowledge in four ways:
+
+- `sft`: train on each statement as it arrives.
+- `augment`: first rewrite each fact into varied Q/A pairs, including reversed questions, written by the
+  model itself (or by a teacher LLM). Then train on all of them.
+- `distill`: read the fact into the RNN state, where in-context learning already "knows" it, and train the
+  context-free model to match the in-context model's full next-token distribution on questions about it.
+  This is state → weights consolidation.
+- `sleep`: buffer facts and consolidate them in shuffled batches with replay.
+
+First comparison: RWKV-7 G1l 1.5B, 5 fictional facts, 3 epochs, LoRA lr 3e-4, anchor weight 3, one run
+each. Training only ever sees the fact statements; the test questions are never trained on.
+
+| strategy | recall | paraphrase | reverse | compose | control questions still right (100% before) |
+|---|---|---|---|---|---|
+| sft | 80% | 40% | 25% | 100% | 88% |
+| augment | 80% | 80% | **100%** | 100% | 62% |
+| distill | **100%** | 80% | 50% | 100% | 75% |
+| sleep | 60% | 40% | 100% | 0% | 62% |
+
+Raw-message training mostly teaches the sentence: rephrased or reversed questions fail. Augmentation and
+distillation make the knowledge usable from other angles, at a price in interference. With one batch of facts
+`sleep` has nothing to replay, so it is effectively another augmentation run. Its gap to `augment` is mostly
+run-to-run noise: the compose column has only two questions. These are single runs on a small fact pack.
+Testing sleep properly needs facts arriving over several "days" and a measure of what earlier days
+retained. That streaming lab is next.
 
 ## Install (Windows, NVIDIA GPU)
 
@@ -129,7 +164,9 @@ Reproduce with `python examples/bench.py path.pth`.
 | `molt/ops.py` | WKV-7 backends: `fla` (chunked Triton), `fla_rec`, `step` (decode), `torch` (reference) |
 | `molt/state.py` | the recurrent state (float32 WKV), save / load / decay / mix |
 | `molt/decode.py` | CUDA-graph decoder |
-| `molt/robot.py` | `Robot`: listen / speak / learn / reflect / reset, memory tiers, anchors |
+| `molt/robot.py` | `Robot`: listen / speak / learn / reflect / reset, memory tiers, anchors, snapshots |
+| `molt/strategies.py` | learning strategies: sft / augment / distill (state → weights) / sleep |
+| `molt/labs/` | lab framework, auto-optimizer, and the injection / horizon / surgery / steering labs |
 | `molt/lora.py` | float32 LoRA, merge back to an official-format `.pth` |
 | `tests/` | parity against official code (all four generations), backend values and gradients, LoRA |
 
@@ -146,13 +183,18 @@ v1 (2023–2024) was ahead of its time, and it also left some bugs and gaps that
 
 ## Roadmap
 
-Molt is the engineering base for **Ouroboros 2**, a study of multi-tier memory for online
-continual learning on real-world chat streams. The question: which information should be written
-to which tier, and does what was written actually get used later? Next steps:
+Molt is the engineering base for **Ouroboros 2**, a study of multi-tier memory for online continual
+learning on real-world chat streams. The question: which information should be written to which tier,
+and does what was written actually get used later? Next steps:
 
-- consolidation from state to weights (sleep-like replay);
-- streaming benchmarks with forward-transfer and retention metrics;
-- baselines (RAG, long context, TTT and Titans-style layers via fla).
+- **Streaming lab**: facts arrive over several "days"; measure what earlier days retained. This is where
+  `sleep` (replay) is supposed to beat online `sft`.
+- **Bigger, multi-seed fact packs**, so differences between strategies clear run-to-run noise.
+- **Preference signals**: a rewritten reply becomes a (rejected, chosen) pair for a DPO-style loss, with the
+  LoRA-off base as the free reference model.
+- **Automatic exams**: a teacher LLM writes test questions for anything learned, so every lab scores itself.
+- **Learned write policy** (RL): reward = later exam accuracy minus forgetting; the action is what to write,
+  to which tier, and for how long. This needs batched decoding first.
 
 ## License and credits
 
@@ -180,11 +222,12 @@ Molt 是 [RWKV-Ouroboros](https://github.com/neromous/RWKV-Ouroboros)（2023）�
 - **三层记忆与自我锚定**：学习新知识时，用 KL 约束模型在自己生成的锚点回答上不偏离学习前的自己，从而抑制灾难性干扰。在 1.5B 上的单例演示中，只写 LoRA 或只写 ego state 时，模型回答无关问题也会复读新学的事实；加上自我锚定后，事实学会了，无关问题也照常回答（见上文表格）。
 - **省显存**：训练时默认开启梯度检查点，交叉熵按块计算。1.5B 在线学习的显存峰值从 16.1 GB 降到约 7 GB。
 
-- **工作台前端**：`python -m molt.server --model 模型.pth` 后打开 http://127.0.0.1:3000 。
-  - 对话按 token 着色，显示每个 token 的意外度，悬停可看候选词；
-  - 任何回复都能改写后立即学习，学习曲线实时更新；
-  - 考题每学一次自动重考，同时看到学会了什么、弄坏了什么；
-  - 记忆热力图显示三层记忆的变化；
-  - 显微镜对比学习前后每个 token 的 Δloss。
+- **实验室**：`python -m molt.server --model 模型.pth` 后打开 http://127.0.0.1:3000 。每个实验室都有可调旋钮、即时测评，还能自动优化：
+  - **知识注入**：比较四种学习策略（原句训练、增广、上下文蒸馏、睡眠巩固），从原题、换问法、反问、组合推理、干扰五个角度考试；
+  - **记忆跨度**：按层组调遗忘速度，看口令找回率随距离的变化；
+  - **状态手术**：点热力图就能关掉某个注意力头，看知识存在哪里；
+  - **行为操控**：用对照例句求出方向，实时拖动强度。
+- **干预层**：衰减缩放、头开关、操控向量、LoRA 强度直接写进前向计算，默认值下与官方实现逐位一致。
+- **初步结论**：只用原句训练，模型基本只会原题，换个问法只答对 40%，反过来问只答对 25%；增广把这两项提到 80% 和 100%，代价是干扰变大。
 
 安装见上文 Install 一节。注意在 Windows 上设置 `PYTHONNOUSERSITE=1`。

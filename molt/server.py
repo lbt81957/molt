@@ -149,6 +149,86 @@ def build_app(robot: Robot, probes: ProbeSet | None = None) -> FastAPI:
             robot.load(body.get("path", "molt_memory"))
             return robot.memory_stats()
 
+    # ---- labs ----------------------------------------------------------------
+    from .labs import LABS, optimize
+    labs = {L.id: L(robot) for L in LABS}
+
+    def lab_of(lid):
+        if lid not in labs:
+            raise HTTPException(404, f"no lab {lid}")
+        return labs[lid]
+
+    def background(job):
+        """Run job(emit) in a worker thread under the model lock; stream its events as SSE."""
+        q: queue.Queue = queue.Queue()
+
+        def work():
+            with lock:
+                try:
+                    q.put({"result": job(q.put)})
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    q.put({"error": repr(e)})
+                finally:
+                    q.put({"interventions": robot.model.interventions()})
+                    q.put(None)
+        threading.Thread(target=work, daemon=True).start()
+        return StreamingResponse(sse(iter(q.get, None)), media_type="text/event-stream")
+
+    @app.get("/api/labs")
+    def list_labs():
+        return [lab.schema() for lab in labs.values()]
+
+    @app.post("/api/labs/{lid}/run")
+    def lab_run(lid: str, body: dict):
+        lab = lab_of(lid)
+        return background(lambda emit: lab.run(lab.values(body.get("values")), emit))
+
+    @app.post("/api/labs/{lid}/optimize")
+    def lab_optimize(lid: str, body: dict):
+        lab = lab_of(lid)
+        search = body.get("search") or [p.name for p in lab.params if p.search]
+        return background(lambda emit: optimize(lab, lab.values(body.get("values")), search,
+                                                int(body.get("trials", 8)), emit))
+
+    @app.post("/api/labs/{lid}/live")
+    def lab_live(lid: str, body: dict):
+        lab = lab_of(lid)
+        with lock:
+            return lab.live(lab.values(body.get("values"))) or {}
+
+    @app.post("/api/labs/{lid}/act")
+    def lab_act(lid: str, body: dict):
+        lab = lab_of(lid)
+        with lock:
+            return lab.act(body.get("action", ""), {**(body.get("values") or {}), **(body.get("payload") or {})}) or {}
+
+    @app.get("/api/interventions")
+    def get_interventions():
+        return robot.model.interventions()
+
+    @app.post("/api/interventions/reset")
+    def reset_interventions():
+        with lock:
+            robot.model.reset_interventions()
+            from .lora import set_dial
+            set_dial(robot.model, 1.0)
+            return robot.model.interventions()
+
+    @app.post("/api/dial")
+    def dial(body: dict):
+        from .lora import set_dial
+        with lock:
+            set_dial(robot.model, float(body.get("value", 1.0)))
+        return {"ok": True}
+
+    @app.post("/api/memory/restore")
+    def restore_memory():
+        with lock:
+            robot.restore("fresh")
+            return {"ok": True}
+
     app.mount("/static", StaticFiles(directory=WEB), name="static")
     return app
 

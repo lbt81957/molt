@@ -112,3 +112,35 @@ def test_lora_starts_as_identity_and_merges(tmp_path):
     with torch.no_grad():
         again, _ = m2(ids)
     assert torch.allclose(again, moved, atol=1e-4)
+
+
+def test_interventions_default_noop_and_effective():
+    m = tiny_model()
+    ids = torch.randint(0, 65536, (1, 10), device=DEV)
+    with torch.no_grad():
+        base, _ = m(ids)
+        m.set_head_scale(1, 0, 0.0)
+        off, _ = m(ids)
+        m.reset_interventions()
+        again, _ = m(ids)
+        m.set_decay_scale(0, None, 0.2)
+        slow, _ = m(ids)
+        m.reset_interventions()
+        m.set_steer(1, torch.ones(m.cfg.n_embd))
+        steered, _ = m(ids)
+        m.reset_interventions()
+    assert torch.equal(base, again)
+    assert not torch.allclose(base, off) and not torch.allclose(base, slow) and not torch.allclose(base, steered)
+
+
+@pytest.mark.skipif(not CUDA, reason="needs CUDA")
+def test_graph_decoder_sees_in_place_interventions():
+    from molt.decode import GraphDecoder
+    m = tiny_model().bfloat16()
+    dec = GraphDecoder(m)
+    a = dec.step(5).clone(); dec.set_state(None)
+    m.set_head_scale(0, None, 0.0)
+    b = dec.step(5).clone(); dec.set_state(None)
+    m.reset_interventions()
+    c = dec.step(5).clone()
+    assert torch.equal(a, c) and not torch.equal(a, b)
