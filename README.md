@@ -176,9 +176,9 @@ Molt 是 [RWKV-Ouroboros](https://github.com/neromous/RWKV-Ouroboros)（2023）�
 
 - **代际支持**：RWKV-7 G1（x070），以及实验架构 x070a、x070b（DEA 混合注意力）、RWKV-8 rc00（x080）。测试直接执行 BlinkDL 官方 demo 代码作为参考，四代模型在 fp32 下的 logit 最大误差约 4e-5。
 - **Windows 上的高速算子**：通过 `triton-windows` 使用 fla 的 Triton kernel，无需编译。梯度可以回传到初始 state，所以 state tuning 和跨段 BPTT 都能做。
-- **CUDA Graph 解码**：Windows 上逐个启动 kernel 的开销很大，把单 token 前向整体捕获后，0.1B 模型的解码速度从 20 提到 376 tok/s，1.5B 为 69 tok/s。
+- **CUDA Graph 解码**：Windows 上逐个启动 kernel 的开销很大，把单 token 前向整体捕获后，0.1B 模型的解码速度从 20 提到 376 tok/s，1.5B 约 68 tok/s。
 - **三层记忆与自我锚定**：学习新知识时，用 KL 约束模型在自己生成的锚点回答上不偏离学习前的自己，从而抑制灾难性干扰。在 1.5B 上的单例演示中，只写 LoRA 或只写 ego state 时，模型回答无关问题也会复读新学的事实；加上自我锚定后，事实学会了，无关问题也照常回答（见上文表格）。
-- **省显存**：训练时默认开启梯度检查点，交叉熵按块计算。1.5B 在线学习的显存峰值从 16.1 GB 降到 7.1 GB。
+- **省显存**：训练时默认开启梯度检查点，交叉熵按块计算。1.5B 在线学习的显存峰值从 16.1 GB 降到约 7 GB。
 
 - **工作台前端**：`python -m molt.server --model 模型.pth` 后打开 http://127.0.0.1:3000 。
   - 对话按 token 着色，显示每个 token 的意外度，悬停可看候选词；
