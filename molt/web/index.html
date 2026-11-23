@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Molt</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">Molt <span id="model-info" class="muted"></span></div>
+  <div class="bar-actions">
+    <button id="btn-settings" class="ghost" aria-expanded="false" aria-controls="settings">设置</button>
+    <button id="btn-theme" class="ghost" title="切换明暗">◐</button>
+  </div>
+</header>
+
+<section id="settings" class="settings" hidden>
+  <fieldset>
+    <legend>生成</legend>
+    <label>温度 <input type="number" step="0.1" min="0" max="2" data-cfg="sampling.temperature"></label>
+    <label>top_p <input type="number" step="0.05" min="0" max="1" data-cfg="sampling.top_p"></label>
+    <label>最大 token <input type="number" step="16" min="16" max="4096" data-cfg="sampling.max_tokens"></label>
+  </fieldset>
+  <fieldset>
+    <legend>学习</legend>
+    <label>LoRA 学习率 <input type="number" step="0.0001" min="0" data-cfg="learn.lr"></label>
+    <label>ego 学习率 <input type="number" step="0.001" min="0" data-cfg="learn.ego_lr"></label>
+    <label>锚定权重 <input type="number" step="0.5" min="0" data-cfg="learn.anchor_weight"></label>
+    <label>轮数 <input type="number" id="epochs" value="3" min="1" max="50"></label>
+  </fieldset>
+  <fieldset class="wide">
+    <legend>自我锚点（每行一个问题；模型先自己回答，学习时约束它不偏离这些回答）</legend>
+    <textarea id="anchor-prompts" rows="3">What is the capital of Japan?
+用一句话解释什么是神经网络。
+Write a haiku about rain.</textarea>
+    <button id="btn-anchors">重新生成锚点</button> <span id="anchor-status" class="muted"></span>
+  </fieldset>
+  <fieldset>
+    <legend>记忆存档</legend>
+    <input id="mem-path" value="molt_memory">
+    <button id="btn-save">保存</button> <button id="btn-load">载入</button>
+  </fieldset>
+</section>
+
+<main class="grid">
+  <!-- 对话 -->
+  <section class="panel chat">
+    <div class="panel-head">
+      <h2>对话</h2>
+      <div class="tools">
+        <label class="switch"><input type="checkbox" id="tint" checked> 意外度着色</label>
+        <button class="ghost" id="btn-reset" title="工作记忆回到 ego">清空工作记忆</button>
+      </div>
+    </div>
+    <div id="messages" class="messages" aria-live="polite"></div>
+    <div class="legend" id="tint-legend"></div>
+    <form id="chat-form" class="composer">
+      <textarea id="prompt" rows="2" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <div class="composer-row">
+        <label class="switch"><input type="checkbox" id="think"> 思考模式</label>
+        <button type="submit" id="send">发送</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- 学习与考题 -->
+  <section class="panel learn">
+    <div class="panel-head"><h2>学习</h2><span id="learn-status" class="muted"></span></div>
+    <div class="teach">
+      <textarea id="teach-text" rows="3" placeholder="教它一段文字（纯文本，整段都算损失）"></textarea>
+      <button id="btn-teach">学习这段文字</button>
+    </div>
+    <figure class="chart">
+      <figcaption>训练损失（每段一个点）</figcaption>
+      <div id="loss-chart" class="linechart"></div>
+    </figure>
+    <figure class="chart" id="kl-figure" hidden>
+      <figcaption>锚定 KL（离学习前的自己有多远）</figcaption>
+      <div id="kl-chart" class="linechart"></div>
+    </figure>
+
+    <div class="panel-head sub"><h2>考题</h2>
+      <button class="ghost" id="btn-eval">立即评测</button></div>
+    <p class="hint muted">每次学习后自动重考。带"期望答案"的题显示答案损失：变低说明学会了，变高说明被干扰了。</p>
+    <form id="probe-form" class="probe-form">
+      <input id="probe-q" placeholder="问题" required>
+      <input id="probe-a" placeholder="期望答案（可选）">
+      <button type="submit">添加</button>
+    </form>
+    <table class="probes">
+      <thead><tr><th>问题</th><th>答案损失</th><th>走势</th><th>最新回答</th><th></th></tr></thead>
+      <tbody id="probe-rows"></tbody>
+    </table>
+  </section>
+
+  <!-- 记忆与显微镜 -->
+  <section class="panel memory">
+    <div class="panel-head"><h2>记忆</h2><button class="ghost" id="btn-mem">刷新</button></div>
+    <figure class="chart"><figcaption>工作记忆 · 各层各头 state 强度</figcaption><div id="hm-working" class="heatmap"></div></figure>
+    <figure class="chart"><figcaption>工作记忆偏离 ego 的距离</figcaption><div id="hm-drift" class="heatmap"></div></figure>
+    <figure class="chart" id="lora-figure"><figcaption>LoRA 更新量 · 各层各模块 ‖ΔW‖</figcaption><div id="hm-lora" class="heatmap"></div></figure>
+
+    <div class="panel-head sub"><h2>显微镜</h2></div>
+    <p class="hint muted">看模型对一段文字每个 token 的意外度（从 ego 状态读）。先"设为基线"，学习后再"对比"，看学习改变了什么。</p>
+    <textarea id="scope-text" rows="3" placeholder="粘贴一段文字"></textarea>
+    <div class="row">
+      <button id="btn-scope">分析</button>
+      <button class="ghost" id="btn-baseline">设为基线</button>
+      <button class="ghost" id="btn-compare" disabled>与基线对比</button>
+    </div>
+    <div id="scope-out" class="scope"></div>
+    <div class="legend" id="scope-legend"></div>
+  </section>
+</main>
+
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

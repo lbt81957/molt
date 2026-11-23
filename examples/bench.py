@@ -47,5 +47,5 @@ torch.cuda.reset_peak_memory_stats()
 t = time.time()
 r = bot.learn(text)
 torch.cuda.synchronize()
-print(f"learn (LoRA r16 + ego, chunk 1024, bptt 2): {r['tokens'] / (time.time() - t):,.0f} tok/s, "
+print(f"learn (LoRA r16, chunk 1024, bptt 2): {r['tokens'] / (time.time() - t):,.0f} tok/s, "
       f"peak VRAM {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")

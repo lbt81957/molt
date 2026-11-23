@@ -12,6 +12,7 @@ use what it read earlier in the same text instead of seeing each chunk in isolat
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -68,7 +69,7 @@ class LearnConfig:
 
 class Robot:
     def __init__(self, model_path, device="cuda", dtype=torch.bfloat16, lora_r: int = 0, lora_alpha: float = 32.0,
-                 tune_ego: bool = True, learn_cfg: LearnConfig | None = None):
+                 tune_ego: bool = False, learn_cfg: LearnConfig | None = None):
         self.model: RWKV7 = RWKV7.from_pretrained(model_path, device=device, dtype=dtype)
         self.tok = RWKVTokenizer()
         self.device = device
@@ -125,8 +126,12 @@ class Robot:
         return st
 
     @torch.no_grad()
-    def speak(self, prompt: str = "", cfg: SamplingConfig | None = None, stream=None) -> str:
-        """Continue from the working state (after reading `prompt`). `stream(piece)` gets text as it is produced."""
+    def speak_iter(self, prompt: str = "", cfg: SamplingConfig | None = None, topk: int = 5):
+        """Generator version of speak(). Yields one dict per sampled token:
+        {"id", "text" (the new characters, may be ""), "p" (model probability of the token),
+         "top": [(text, p), ...] (the model's top-k alternatives)}; probabilities are the raw
+        model distribution (temperature 1, no penalties), so they explain the model, not the sampler.
+        The final yield is {"done": True, "text": reply}."""
         cfg = cfg or self.sampling
         ids = self.tok.encode(prompt) if prompt else []
         if len(ids) > 1:
@@ -134,27 +139,51 @@ class Robot:
         first = ids[-1] if ids else 261  # "\n\n"
         step = self._stepper()
         occ = torch.zeros(self.model.cfg.vocab_size, device=self.device)
-        out, text, emitted, tok = [], "", 0, first
+        out, text, tok = [], "", first
+        hold = max((len(s) for s in cfg.stop), default=0)
+        queue, attributed = [], 0  # tokens not yet sent; characters already given to some token
         for _ in range(cfg.max_tokens):
             logits = step(tok)
+            probs = torch.softmax(logits.float(), -1)
             tok = sample(logits, cfg, occ)
             if tok == 0:  # end_of_doc
                 break
             out.append(tok)
             text = self.tok.decode(out)
+            tp, ti = probs.topk(topk)
+            # a token's own text: the characters it completes (a split UTF-8 character goes to the token finishing it)
+            stable = len(text) - (1 if text.endswith("�") else 0)
+            queue.append({"id": tok, "p": float(probs[tok]), "text": text[attributed:stable],
+                          "top": [(self.tok.decode([i]), round(float(p), 4)) for p, i in zip(tp.tolist(), ti.tolist())]})
+            attributed = max(attributed, stable)
             hit = next((s for s in cfg.stop if s in text), None)
             if hit:
                 text = text[: text.index(hit)]
                 break
-            safe = len(text) - max(len(s) for s in cfg.stop) if cfg.stop else len(text)
-            if stream and safe > emitted and "�" not in text[emitted:safe]:
-                stream(text[emitted:safe]); emitted = safe
-        if stream and len(text) > emitted:
-            stream(text[emitted:])
+            # send tokens whose text lies entirely before the hold-back zone (a stop string may still form there)
+            pos = attributed - sum(len(d["text"]) for d in queue)
+            while queue and pos + len(queue[0]["text"]) <= len(text) - hold:
+                pos += len(queue[0]["text"])
+                yield queue.pop(0)
+        pos = attributed - sum(len(d["text"]) for d in queue)
+        for d in queue:  # flush, trimming whatever lies past a cut stop string
+            keep = max(0, min(len(d["text"]), len(text) - pos))
+            pos += len(d["text"])
+            if keep:
+                d["text"] = d["text"][:keep]
+                yield d
         # Re-read the reply as kept (stop string cut, turn closed with "\n\n") so the working
         # state matches the transcript exactly rather than whatever was sampled past the stop.
         self.listen([first] + self.tok.encode(text + "\n\n"))
-        return text
+        yield {"done": True, "text": text}
+
+    def speak(self, prompt: str = "", cfg: SamplingConfig | None = None, stream=None) -> str:
+        """Continue from the working state (after reading `prompt`). `stream(piece)` gets text as it is produced."""
+        for d in self.speak_iter(prompt, cfg):
+            if d.get("done"):
+                return d["text"]
+            if stream and d["text"]:
+                stream(d["text"])
 
     def _stepper(self):
         """One-token decode function starting from the working state (which it does not modify).
@@ -186,6 +215,45 @@ class Robot:
             tot += F.cross_entropy(logits[0].float(), torch.tensor(x[1:], device=self.device), reduction="sum").item()
             n += len(x) - 1
         return {"loss": tot / max(n, 1), "ppl": float(torch.tensor(tot / max(n, 1)).exp()), "tokens": n}
+
+    @torch.no_grad()
+    def token_losses(self, text: str, state: State | None = None, prefix: str = "") -> list[dict]:
+        """Per-token surprise of `text` (after reading `prefix`) under the current memory:
+        [{"text", "loss", "p", "top": [(text, p)] }]. Nothing is updated."""
+        st = self.state if state is None else state
+        pre = self.tok.encode(prefix) if prefix else []
+        ids = self.tok.encode(text)
+        if pre[:-1]:
+            st = self.listen(pre[:-1], state=st)
+        seq = (pre[-1:] or [261]) + ids
+        logits, _ = self.model(torch.tensor([seq[:-1]], device=self.device), st)
+        lp = torch.log_softmax(logits[0].float(), -1)
+        tgt = torch.tensor(seq[1:], device=self.device)
+        loss = -lp.gather(1, tgt[:, None])[:, 0]
+        tp, ti = lp.exp().topk(3, -1)
+        return [{"text": self.tok.decode([t]), "loss": round(float(l), 3), "p": round(math.exp(-l), 4),
+                 "top": [(self.tok.decode([i]), round(p, 3)) for p, i in zip(a, b)]}
+                for t, l, a, b in zip(ids, loss.tolist(), tp.tolist(), ti.tolist())]
+
+    # ---- introspection ----------------------------------------------------
+    @torch.no_grad()
+    def memory_stats(self) -> dict:
+        """Numbers behind the memory heatmaps: per layer x head WKV norms of the working state,
+        its distance from ego, ego norms, and per layer x module LoRA update norms ||scale*B@A||."""
+        w = self.state.wkv[:, 0].float()                      # [L, H, N, N]
+        e = self.ego_wkv.detach()[:, 0].float()
+        norm = lambda t: t.flatten(2).norm(dim=-1).cpu().tolist()
+        out = {"working": norm(w), "drift": norm(w - e), "ego": norm(e), "lora": None, "lora_modules": []}
+        from .lora import LoRALinear
+        mods = [(n, m) for n, m in self.model.named_modules() if isinstance(m, LoRALinear)]
+        if mods:
+            names = sorted({n.split(".", 2)[2] for n, _ in mods})
+            grid = [[0.0] * len(names) for _ in range(self.model.cfg.n_layer)]
+            for n, m in mods:
+                layer = int(n.split(".")[1])
+                grid[layer][names.index(n.split(".", 2)[2])] = float((m.lora_B @ m.lora_A).norm() * m.scale)
+            out["lora"], out["lora_modules"] = grid, names
+        return out
 
     # ---- learning ---------------------------------------------------------
     @torch.no_grad()
@@ -234,12 +302,13 @@ class Robot:
             self._opt = torch.optim.AdamW(groups, weight_decay=c.weight_decay, betas=(0.9, 0.99))
         return self._opt
 
-    def learn(self, data, epochs: int = 1, absorb: bool = False) -> dict:
+    def learn(self, data, epochs: int = 1, absorb: bool = False, on_chunk=None) -> dict:
         """Gradient-update the slow memory tiers on `data`.
 
         data: a string, a list of strings, or a list of segment lists [(text, train?), ...]
               (use chat_segments() for dialogues: loss only on the assistant's words).
         absorb: afterwards also read the data into the working state.
+        on_chunk: called after every trained chunk with {"i", "loss", "tokens", "kl" (anchor KL, at optimizer steps)}.
         """
         items = [data] if isinstance(data, str) or (data and isinstance(data[0], tuple)) else list(data)
         c, opt, m = self.learn_cfg, self._optimizer(), self.model
@@ -266,11 +335,16 @@ class Robot:
                     losses.append(loss.item()); n_tok += int(mk.sum())
                     scale = c.gate_scale if loss.item() < c.min_loss else 1.0
                     acc = acc + loss * scale; k += 1
+                    kl = None
                     if k == c.bptt:
-                        self._step(acc / k, opt); acc, k = 0.0, 0
+                        kl = self._step(acc / k, opt); acc, k = 0.0, 0
                         st = st.detach()
+                    if on_chunk:
+                        on_chunk({"i": len(losses), "loss": losses[-1], "tokens": int(mk.sum()), "kl": kl})
                 if k:
-                    self._step(acc / k, opt)
+                    kl = self._step(acc / k, opt)
+                    if on_chunk and kl is not None:
+                        on_chunk({"i": len(losses), "loss": losses[-1], "tokens": 0, "kl": kl})
         m.eval()
         m.grad_checkpoint = False
         self.model.requires_grad_(False)
@@ -284,13 +358,27 @@ class Robot:
         return rec
 
     def _step(self, loss, opt):
+        """One optimizer step; returns the anchor KL (None if anchoring is off)."""
         opt.zero_grad(set_to_none=True)
+        kl = None
         if self.learn_cfg.anchor_weight > 0 and self.anchors:
-            loss = loss + self.learn_cfg.anchor_weight * self._anchor_loss()
+            kl_t = self._anchor_loss()
+            loss = loss + self.learn_cfg.anchor_weight * kl_t
+            kl = kl_t.item()
         loss.backward()
         params = [p for g in opt.param_groups for p in g["params"]]
         torch.nn.utils.clip_grad_norm_(params, self.learn_cfg.grad_clip)
         opt.step()
+        return kl
+
+    def set_learn_config(self, **kw):
+        """Change learning hyper-parameters on the fly (learning rates apply to the live optimizer)."""
+        for k, v in kw.items():
+            if hasattr(self.learn_cfg, k):
+                setattr(self.learn_cfg, k, type(getattr(self.learn_cfg, k))(v))
+        if self._opt is not None:
+            for g in self._opt.param_groups:
+                g["lr"] = self.learn_cfg.ego_lr if any(p is self.ego_wkv for p in g["params"]) else self.learn_cfg.lr
 
     # ---- persistence ------------------------------------------------------
     def save(self, path):

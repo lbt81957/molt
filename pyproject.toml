@@ -20,7 +20,7 @@ dev = ["pytest"]
 include = ["molt*"]
 
 [tool.setuptools.package-data]
-molt = ["assets/*.txt"]
+molt = ["assets/*.txt", "web/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

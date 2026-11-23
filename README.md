@@ -26,7 +26,8 @@ its `listen / speak / learn` interface, and rebuilds everything else for the RWK
   Molt captures the whole one-token step in a CUDA graph: 20 → 376 tok/s on a 0.1B model.
 - **Three memory tiers.**
   - `state`: working memory, written by every `listen` and `speak`.
-  - `ego`: a learned initial state (state tuning). `reset()` returns to it.
+  - `ego`: a learned initial state (state tuning). `reset()` returns to it. Training it is opt-in
+    (`tune_ego=True`): in our probes, writing facts into ego alone overwrote unrelated answers.
   - LoRA: float32 adapters over a frozen bf16 base, so tiny online updates are not rounded away.
 - **Learning that carries context.** Long texts are split into chunks and the state is carried
   across chunk boundaries (truncated BPTT), so the model learns to use what it read earlier.
@@ -35,6 +36,25 @@ its `listen / speak / learn` interface, and rebuilds everything else for the RWK
   The snake eats its own tail.
 - **Human-in-the-loop.** Includes an HTTP API (`molt.server`) and a terminal chat
   (`molt.chat`). In the chat, `/fix <better answer>` teaches the model your correction at once.
+
+## The workbench
+
+`python -m molt.server --model path.pth`, then open <http://127.0.0.1:3000>. It is a single page with no
+build step, served by the same process.
+
+![Molt workbench](docs/screenshot.png)
+
+- **Chat with token-level surprise.** Each generated token is tinted by how unexpected it was to the
+  model. Hover a token to see its probability and the model's top-5 alternatives.
+- **Correct a reply and learn from it.** Rewrite any reply and the model learns your version at once.
+  The loss curve and the anchor-KL curve update live, chunk by chunk.
+- **Probes.** A fixed set of questions, re-run after every learning step. For each one you see the
+  loss on the expected answer and its trend, plus whether the answer changed. Together they show what was
+  acquired and what was damaged.
+- **Memory maps.** Heatmaps of the working state (layer × head), how far it has drifted from ego,
+  and the LoRA update norm per layer and module.
+- **Microscope.** Paste any text to see per-token surprise. Set a baseline, learn something, then
+  compare to see the per-token Δloss.
 
 ## Install (Windows, NVIDIA GPU)
 
@@ -60,7 +80,7 @@ Weights: <https://huggingface.co/BlinkDL/rwkv7-g1> (for example `rwkv7-g1l-1.5b-
 from molt.robot import Robot, LearnConfig, chat_segments
 
 bot = Robot("rwkv7-g1l-1.5b-20261031-ctx34304.pth", lora_r=16,
-            learn_cfg=LearnConfig(lr=1e-3, anchor_weight=1.0))
+            learn_cfg=LearnConfig(lr=3e-4, anchor_weight=3.0))
 bot.make_anchors(["What is the capital of Japan?", "Write a haiku about rain."])
 
 print(bot.chat("What is Molt?"))
@@ -93,10 +113,10 @@ else intact.
 
 ## Speed (RTX 4060 Ti 16 GB, Windows 11, bf16)
 
-| model | prefill 8k | decode (CUDA graph) | learn (LoRA r16 + ego) | peak VRAM when learning |
+| model | prefill 8k | decode (CUDA graph) | learn (LoRA r16) | peak VRAM when learning |
 |---|---|---|---|---|
-| G1d 0.1B | 61k tok/s | 376 tok/s | 3.5k tok/s | 3.7 GB |
-| G1l 1.5B | 7.5k tok/s | 69 tok/s | 1.2k tok/s | 7.1 GB |
+| G1d 0.1B | 61k tok/s | 376 tok/s | 2.2k tok/s | 1.3 GB |
+| G1l 1.5B | 7.5k tok/s | 68 tok/s | 1.1k tok/s | 7.0 GB |
 
 Reproduce with `python examples/bench.py path.pth`.
 
@@ -159,5 +179,12 @@ Molt 是 [RWKV-Ouroboros](https://github.com/neromous/RWKV-Ouroboros)（2023）�
 - **CUDA Graph 解码**：Windows 上逐个启动 kernel 的开销很大，把单 token 前向整体捕获后，0.1B 模型的解码速度从 20 提到 376 tok/s，1.5B 为 69 tok/s。
 - **三层记忆与自我锚定**：学习新知识时，用 KL 约束模型在自己生成的锚点回答上不偏离学习前的自己，从而抑制灾难性干扰。在 1.5B 上的单例演示中，只写 LoRA 或只写 ego state 时，模型回答无关问题也会复读新学的事实；加上自我锚定后，事实学会了，无关问题也照常回答（见上文表格）。
 - **省显存**：训练时默认开启梯度检查点，交叉熵按块计算。1.5B 在线学习的显存峰值从 16.1 GB 降到 7.1 GB。
+
+- **工作台前端**：`python -m molt.server --model 模型.pth` 后打开 http://127.0.0.1:3000 。
+  - 对话按 token 着色，显示每个 token 的意外度，悬停可看候选词；
+  - 任何回复都能改写后立即学习，学习曲线实时更新；
+  - 考题每学一次自动重考，同时看到学会了什么、弄坏了什么；
+  - 记忆热力图显示三层记忆的变化；
+  - 显微镜对比学习前后每个 token 的 Δloss。
 
 安装见上文 Install 一节。注意在 Windows 上设置 `PYTHONNOUSERSITE=1`。
